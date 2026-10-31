@@ -20,17 +20,20 @@ pub struct DetectorConfig {
     pub max_rms_radius: f32,
     /// 許容する楕円の長径/短径比の上限
     pub ellipse_major_over_minor_max: f32,
+    /// 230〜280° の短い親指ストロークを、緩い閉合で成立させる（実機向け）
+    pub allow_thumb_partial_closure: bool,
 }
 
 impl Default for DetectorConfig {
     fn default() -> Self {
         Self {
-            window_ms: 350,
-            min_total_angle_deg: 300.0,
-            min_net_angle_deg: 270.0,
+            window_ms: 550,
+            min_total_angle_deg: 230.0,
+            min_net_angle_deg: 200.0,
             min_rms_radius: 8.0,
             max_rms_radius: 2000.0,
-            ellipse_major_over_minor_max: 2.8,
+            ellipse_major_over_minor_max: 3.6,
+            allow_thumb_partial_closure: false,
         }
     }
 }
@@ -47,6 +50,15 @@ pub struct CircleDetector {
     is_dragging: bool,
     virtual_time_ms: u64,
     samples: Vec<TimedDelta>,
+    last_detection: Option<GestureWindowStats>,
+}
+
+/// 現在のスライディング窓の計測値（PoC デバッグ・表示用）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GestureWindowStats {
+    pub elapsed_ms: u64,
+    pub signed_angle_deg: f32,
+    pub net_angle_deg: f32,
 }
 
 impl CircleDetector {
@@ -56,6 +68,7 @@ impl CircleDetector {
             is_dragging: false,
             virtual_time_ms: 0,
             samples: Vec::new(),
+            last_detection: None,
         }
     }
 
@@ -81,6 +94,7 @@ impl CircleDetector {
         self.purge_old_samples();
 
         if self.evaluate_window() {
+            self.last_detection = Some(self.window_stats());
             self.clear_window();
             return true;
         }
@@ -88,7 +102,28 @@ impl CircleDetector {
         false
     }
 
+    /// 直近の成功検知時に記録された窓統計（`push` が `true` を返した直後のみ有効）。
+    pub fn last_detection_stats(&self) -> Option<GestureWindowStats> {
+        self.last_detection
+    }
+
+    /// 現在窓内の累積角度と、最古〜最新サンプル間の時間幅（≤ `window_ms`）。
+    pub fn window_stats(&self) -> GestureWindowStats {
+        let signed_angle_deg = self.cumulative_signed_angle_deg();
+        GestureWindowStats {
+            elapsed_ms: self.window_span_ms(),
+            signed_angle_deg,
+            net_angle_deg: signed_angle_deg.abs(),
+        }
+    }
+
+    /// 180° 超の弧でサークル不成立のとき、最初に満たさない条件（デバッグ用）。
+    pub fn circle_reject_reason(&self) -> Option<&'static str> {
+        self.evaluate_window_failure()
+    }
+
     pub fn reset(&mut self) {
+        self.last_detection = None;
         self.clear_window();
     }
 
@@ -104,39 +139,86 @@ impl CircleDetector {
         self.samples.retain(|s| s.end_time_ms > cutoff);
     }
 
+    /// スライディング窓内に残っているサンプルの時間幅（最古の end_time 〜 最新の end_time）。
+    fn window_span_ms(&self) -> u64 {
+        match (self.samples.first(), self.samples.last()) {
+            (Some(first), Some(last)) if !self.samples.is_empty() => {
+                last.end_time_ms.saturating_sub(first.end_time_ms)
+            }
+            _ => 0,
+        }
+    }
+
     fn evaluate_window(&self) -> bool {
+        self.evaluate_window_failure().is_none()
+    }
+
+    fn evaluate_window_failure(&self) -> Option<&'static str> {
         let n = self.samples.len();
         if n < 3 {
-            return false;
+            return Some("too_few_samples");
         }
 
         let signed_angle_deg = self.cumulative_signed_angle_deg();
         let net_angle_deg = signed_angle_deg.abs();
         if net_angle_deg < self.config.min_net_angle_deg {
-            return false;
+            return Some("net_angle");
         }
         if net_angle_deg < self.config.min_total_angle_deg {
-            return false;
+            return Some("total_angle");
         }
 
         let positions = self.cumulative_positions();
         let rms = rms_radius(&positions);
-        if rms < self.config.min_rms_radius || rms > self.config.max_rms_radius {
-            return false;
+        if rms < self.config.min_rms_radius {
+            return Some("rms_low");
+        }
+        if rms > self.config.max_rms_radius {
+            return Some("rms_high");
         }
 
         let aspect = ellipse_aspect_ratio(&positions);
         if aspect > self.config.ellipse_major_over_minor_max {
-            return false;
+            return Some("aspect");
         }
 
         let (disp_x, disp_y) = net_displacement_from(&self.samples);
-        let closure_limit = (rms * 0.35).max(2.0);
-        if disp_x.hypot(disp_y) > closure_limit {
-            return false;
+        let disp = disp_x.hypot(disp_y);
+        if !Self::closure_satisfied(
+            net_angle_deg,
+            rms,
+            disp,
+            self.config.min_total_angle_deg,
+            self.config.allow_thumb_partial_closure,
+        ) {
+            return Some("not_closed");
         }
 
-        true
+        None
+    }
+
+    /// 350°〜: 閉合許容内なら成立。230〜280° は `allow_thumb_partial_closure` 時のみ同様。
+    fn closure_satisfied(
+        net_angle_deg: f32,
+        rms: f32,
+        disp: f32,
+        min_total_angle_deg: f32,
+        allow_thumb_partial_closure: bool,
+    ) -> bool {
+        let limit = closure_displacement_limit(rms);
+        if allow_thumb_partial_closure
+            && net_angle_deg >= min_total_angle_deg
+            && net_angle_deg < 280.0
+        {
+            return disp <= limit;
+        }
+        if (280.0..350.0).contains(&net_angle_deg) {
+            return false;
+        }
+        if net_angle_deg >= 350.0 {
+            return disp <= limit;
+        }
+        false
     }
 
     fn cumulative_signed_angle_deg(&self) -> f32 {
@@ -145,6 +227,17 @@ impl CircleDetector {
             let a = self.samples[i - 1];
             let b = self.samples[i];
             total_rad += signed_angle_rad(a.dx, a.dy, b.dx, b.dy);
+        }
+        if self.samples.len() >= 3 {
+            let positions = self.cumulative_positions();
+            let rms = rms_radius(&positions);
+            let (dx, dy) = net_displacement_from(&self.samples);
+            let disp = dx.hypot(dy);
+            if closure_angle_addition_allowed(rms, disp) {
+                let last = self.samples[self.samples.len() - 1];
+                let first = self.samples[0];
+                total_rad += signed_angle_rad(last.dx, last.dy, first.dx, first.dy);
+            }
         }
         total_rad.to_degrees()
     }
@@ -163,6 +256,19 @@ impl CircleDetector {
 }
 
 const MIN_VECTOR_LEN_SQ: f32 = 1e-4;
+/// 始点–終点距離の許容: `disp <= max(rms * factor, min_px)`
+const CLOSURE_RMS_FACTOR: f32 = 0.65;
+const CLOSURE_DISP_MIN_PX: f32 = 10.0;
+/// 最終→最初の Δθ は、始点–終点がほぼ一致したときだけ加算
+const CLOSURE_ANGLE_DISP_MAX_PX: f32 = 2.5;
+
+fn closure_displacement_limit(rms: f32) -> f32 {
+    (rms * CLOSURE_RMS_FACTOR).max(CLOSURE_DISP_MIN_PX)
+}
+
+fn closure_angle_addition_allowed(_rms: f32, disp: f32) -> bool {
+    disp <= CLOSURE_ANGLE_DISP_MAX_PX
+}
 
 fn signed_angle_rad(ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
     if ax * ax + ay * ay < MIN_VECTOR_LEN_SQ || bx * bx + by * by < MIN_VECTOR_LEN_SQ {
@@ -395,7 +501,7 @@ mod tests {
     #[test]
     fn test_too_slow() {
         let mut det = default_detector();
-        let samples = circle_deltas(40.0, 16, 800, true, 1.0);
+        let samples = circle_deltas(40.0, 16, 1000, true, 1.0);
         let results = push_all(&mut det, &samples);
         assert_all_false(&results);
     }
@@ -493,8 +599,8 @@ mod tests {
     #[test]
     fn test_window_sliding() {
         let mut det = default_detector();
-        // 1周 500ms: 終了時点の 350ms 窓には約 252° 分しか入らない
-        let samples = circle_deltas(40.0, 16, 500, true, 1.0);
+        // 1周 900ms: 終了時点の 550ms 窓には約 220° 分しか入らない（230° 閾値未満）
+        let samples = circle_deltas(40.0, 16, 900, true, 1.0);
         let results = push_all(&mut det, &samples);
         assert_all_false(&results);
     }

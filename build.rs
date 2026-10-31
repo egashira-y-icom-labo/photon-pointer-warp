@@ -1,19 +1,4 @@
-fn main() {
-    println!("cargo:rerun-if-changed=app.manifest");
+// PoC1: WSL UNC 上での mt.exe マニフェスト埋め込みを回避するため、リンク引数は無効。
+// DPI は実行時 `SetProcessDpiAwarenessContext` で設定（win32_poc.rs）。
 
-    let target = std::env::var("TARGET").unwrap_or_default();
-    if !target.contains("windows") {
-        return;
-    }
-
-    let manifest = std::path::Path::new("app.manifest");
-    let manifest = manifest
-        .canonicalize()
-        .unwrap_or_else(|_| manifest.to_path_buf());
-
-    println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
-    println!(
-        "cargo:rustc-link-arg=/MANIFESTINPUT:{}",
-        manifest.display()
-    );
-}
+fn main() {}
