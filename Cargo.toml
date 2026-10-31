@@ -1,0 +1,12 @@
+[package]
+name = "photon-pointer-warp"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+approx = "0.5"
