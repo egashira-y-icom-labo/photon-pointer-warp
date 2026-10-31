@@ -35,9 +35,18 @@ impl Default for DetectorConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TimedDelta {
+    dx: f32,
+    dy: f32,
+    end_time_ms: u64,
+}
+
 pub struct CircleDetector {
     config: DetectorConfig,
     is_dragging: bool,
+    virtual_time_ms: u64,
+    samples: Vec<TimedDelta>,
 }
 
 impl CircleDetector {
@@ -45,21 +54,186 @@ impl CircleDetector {
         Self {
             config,
             is_dragging: false,
+            virtual_time_ms: 0,
+            samples: Vec::new(),
         }
     }
 
     pub fn set_drag_state(&mut self, is_dragging: bool) {
+        if is_dragging {
+            self.clear_window();
+        }
         self.is_dragging = is_dragging;
     }
 
     /// サークル完成と判定したサンプルでのみ `true`。完成後は内部で [`Self::reset`] 相当。
-    pub fn push(&mut self, _sample: MotionSample) -> bool {
-        todo!("CircleDetector::push")
+    pub fn push(&mut self, sample: MotionSample) -> bool {
+        if self.is_dragging {
+            return false;
+        }
+
+        self.virtual_time_ms = self.virtual_time_ms.saturating_add(sample.dt_millis);
+        self.samples.push(TimedDelta {
+            dx: sample.dx,
+            dy: sample.dy,
+            end_time_ms: self.virtual_time_ms,
+        });
+        self.purge_old_samples();
+
+        if self.evaluate_window() {
+            self.clear_window();
+            return true;
+        }
+
+        false
     }
 
     pub fn reset(&mut self) {
-        todo!("CircleDetector::reset")
+        self.clear_window();
     }
+
+    fn clear_window(&mut self) {
+        self.virtual_time_ms = 0;
+        self.samples.clear();
+    }
+
+    fn purge_old_samples(&mut self) {
+        let cutoff = self
+            .virtual_time_ms
+            .saturating_sub(self.config.window_ms);
+        self.samples.retain(|s| s.end_time_ms > cutoff);
+    }
+
+    fn evaluate_window(&self) -> bool {
+        let n = self.samples.len();
+        if n < 3 {
+            return false;
+        }
+
+        let signed_angle_deg = self.cumulative_signed_angle_deg();
+        let net_angle_deg = signed_angle_deg.abs();
+        if net_angle_deg < self.config.min_net_angle_deg {
+            return false;
+        }
+        if net_angle_deg < self.config.min_total_angle_deg {
+            return false;
+        }
+
+        let positions = self.cumulative_positions();
+        let rms = rms_radius(&positions);
+        if rms < self.config.min_rms_radius || rms > self.config.max_rms_radius {
+            return false;
+        }
+
+        let aspect = ellipse_aspect_ratio(&positions);
+        if aspect > self.config.ellipse_major_over_minor_max {
+            return false;
+        }
+
+        let (disp_x, disp_y) = net_displacement_from(&self.samples);
+        let closure_limit = (rms * 0.35).max(2.0);
+        if disp_x.hypot(disp_y) > closure_limit {
+            return false;
+        }
+
+        true
+    }
+
+    fn cumulative_signed_angle_deg(&self) -> f32 {
+        let mut total_rad = 0.0_f32;
+        for i in 1..self.samples.len() {
+            let a = self.samples[i - 1];
+            let b = self.samples[i];
+            total_rad += signed_angle_rad(a.dx, a.dy, b.dx, b.dy);
+        }
+        total_rad.to_degrees()
+    }
+
+    fn cumulative_positions(&self) -> Vec<(f32, f32)> {
+        let mut positions = Vec::with_capacity(self.samples.len());
+        let mut x = 0.0_f32;
+        let mut y = 0.0_f32;
+        for s in &self.samples {
+            x += s.dx;
+            y += s.dy;
+            positions.push((x, y));
+        }
+        positions
+    }
+}
+
+const MIN_VECTOR_LEN_SQ: f32 = 1e-4;
+
+fn signed_angle_rad(ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    if ax * ax + ay * ay < MIN_VECTOR_LEN_SQ || bx * bx + by * by < MIN_VECTOR_LEN_SQ {
+        return 0.0;
+    }
+    let cross = ax * by - ay * bx;
+    let dot = ax * bx + ay * by;
+    cross.atan2(dot)
+}
+
+fn net_displacement_from(samples: &[TimedDelta]) -> (f32, f32) {
+    let mut x = 0.0_f32;
+    let mut y = 0.0_f32;
+    for s in samples {
+        x += s.dx;
+        y += s.dy;
+    }
+    (x, y)
+}
+
+fn rms_radius(positions: &[(f32, f32)]) -> f32 {
+    if positions.is_empty() {
+        return 0.0;
+    }
+    let n = positions.len() as f32;
+    let cx = positions.iter().map(|p| p.0).sum::<f32>() / n;
+    let cy = positions.iter().map(|p| p.1).sum::<f32>() / n;
+    let mean_sq = positions
+        .iter()
+        .map(|(x, y)| {
+            let dx = x - cx;
+            let dy = y - cy;
+            dx * dx + dy * dy
+        })
+        .sum::<f32>()
+        / n;
+    mean_sq.sqrt()
+}
+
+fn ellipse_aspect_ratio(positions: &[(f32, f32)]) -> f32 {
+    if positions.len() < 3 {
+        return f32::INFINITY;
+    }
+    let n = positions.len() as f32;
+    let cx = positions.iter().map(|p| p.0).sum::<f32>() / n;
+    let cy = positions.iter().map(|p| p.1).sum::<f32>() / n;
+
+    let mut xx = 0.0_f32;
+    let mut yy = 0.0_f32;
+    let mut xy = 0.0_f32;
+    for (x, y) in positions {
+        let dx = x - cx;
+        let dy = y - cy;
+        xx += dx * dx;
+        yy += dy * dy;
+        xy += dx * dy;
+    }
+    xx /= n;
+    yy /= n;
+    xy /= n;
+
+    let trace = xx + yy;
+    let det = xx * yy - xy * xy;
+    let half_trace = trace * 0.5;
+    let disc = (half_trace * half_trace - det).max(0.0);
+    let lambda1 = half_trace + disc.sqrt();
+    let lambda2 = half_trace - disc.sqrt();
+    if lambda2 <= 1e-6 {
+        return f32::INFINITY;
+    }
+    (lambda1 / lambda2).sqrt()
 }
 
 #[cfg(test)]
@@ -281,9 +455,10 @@ mod tests {
     fn test_partial_arc_270deg() {
         let mut det = default_detector();
         let full_steps = 16u32;
-        let arc_steps = (full_steps as f32 * 270.0 / 360.0).round() as u32;
-        let samples = circle_deltas(40.0, arc_steps, 280, true, 1.0);
-        let results = push_all(&mut det, &samples);
+        let full = circle_deltas(40.0, full_steps, 280, true, 1.0);
+        let arc_len = (full.len() as f32 * 270.0 / 360.0).round() as usize;
+        let samples = &full[..arc_len];
+        let results = push_all(&mut det, samples);
         assert_all_false(&results);
     }
 

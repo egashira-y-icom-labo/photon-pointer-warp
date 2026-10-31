@@ -2,11 +2,26 @@
 name = "photon-pointer-warp"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "photon-pointer-warp"
+path = "src/main.rs"
+
 [dependencies]
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Console",
+] }
 
 [dev-dependencies]
 approx = "0.5"
