@@ -62,6 +62,8 @@ const SETTLING_WINDOW_MS: u64 = 50;
 const SETTLING_MAX_WAIT_MS: u64 = 100;
 /// 1 サンプルあたりの移動量（|Δ|）がこれを超えたら「大きな移動」とみなす。
 const SETTLING_SPEED_THRESHOLD: f32 = 3.0;
+/// 連続ワープ着地後、無操作なら HUD を消すまでの時間。
+const CHAINED_WARP_TIMEOUT_MS: u64 = 2000;
 
 struct PendingSettling {
     started_at: Instant,
@@ -86,6 +88,8 @@ struct AppState {
     hud: HudOverlay,
     esc_hotkey_registered: bool,
     pending_settling: Option<PendingSettling>,
+    /// 連続ワープ着地（または最後のマウス移動）時刻。2 秒無操作でオートディスミス。
+    chained_warp_started_at: Option<Instant>,
 }
 
 static APP: OnceLock<Mutex<AppState>> = OnceLock::new();
@@ -229,6 +233,7 @@ pub fn run() -> io::Result<()> {
                 hud,
                 esc_hotkey_registered: false,
                 pending_settling: None,
+                chained_warp_started_at: None,
             })
         });
 
@@ -329,6 +334,16 @@ fn hud_pointer_out_of_bounds(hud: &HudOverlay) -> bool {
     cursor_screen_pos().is_some_and(|(x, y)| hud.pointer_beyond_dismiss_margin(x, y))
 }
 
+fn chained_warp_auto_dismiss_due(started_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(started_at).as_millis() as u64 >= CHAINED_WARP_TIMEOUT_MS
+}
+
+fn note_chained_warp_activity(state: &mut AppState) {
+    if state.chained_warp_started_at.is_some() {
+        state.chained_warp_started_at = Some(Instant::now());
+    }
+}
+
 fn flush_pending_on_idle() {
     let mut guard = match APP.get().and_then(|a| a.lock().ok()) {
         Some(g) => g,
@@ -342,10 +357,17 @@ fn flush_pending_on_idle() {
         flush_pending_debug(&mut guard);
     }
     let _ = try_finish_settling(&mut guard);
-    let should_dismiss = guard.hud.is_active() && hud_pointer_out_of_bounds(&guard.hud);
+    let should_dismiss_oob = guard.hud.is_active() && hud_pointer_out_of_bounds(&guard.hud);
+    let should_auto_timeout = !should_dismiss_oob
+        && guard.hud.is_active()
+        && guard
+            .chained_warp_started_at
+            .is_some_and(|t| chained_warp_auto_dismiss_due(t, Instant::now()));
     drop(guard);
-    if should_dismiss {
+    if should_dismiss_oob {
         dismiss_hud_with_log("out of bounds");
+    } else if should_auto_timeout {
+        dismiss_hud_with_log("auto timeout");
     }
 }
 
@@ -477,6 +499,7 @@ unsafe fn handle_wm_input(lparam: LPARAM) -> io::Result<()> {
                     return Ok(());
                 }
                 let _ = guard.hud.update_hover_from_screen(x, y);
+                note_chained_warp_activity(&mut guard);
             }
         }
         return Ok(());
@@ -609,6 +632,7 @@ fn dismiss_hud_with_log(reason: &str) {
     if !guard.hud.is_active() {
         return;
     }
+    guard.chained_warp_started_at = None;
     if let Err(e) = unsafe { guard.hud.dismiss() } {
         eprintln!("HUD dismiss error: {e}");
         return;
@@ -619,11 +643,6 @@ fn dismiss_hud_with_log(reason: &str) {
 }
 
 fn warp_hud_to_cell(col: usize, row: usize) {
-    let raw = MESSAGE_HWND.load(Ordering::Acquire);
-    if raw == 0 {
-        return;
-    }
-    let message_hwnd = HWND(raw as _);
     let mut guard = match APP.get().and_then(|a| a.lock().ok()) {
         Some(g) => g,
         None => return,
@@ -637,13 +656,13 @@ fn warp_hud_to_cell(col: usize, row: usize) {
         eprintln!("SetCursorPos error: {e}");
         return;
     }
-    if let Err(e) = unsafe { guard.hud.dismiss() } {
-        eprintln!("HUD dismiss error: {e}");
-        return;
-    }
-    unregister_esc_hotkey_state(&mut guard, message_hwnd);
     println!("[warp] Jumped to ({target_x}, {target_y}) [cell: {col}, {row}]");
     let _ = io::stdout().flush();
+    if let Err(e) = unsafe { guard.hud.activate_at_cursor() } {
+        eprintln!("[hud] Failed to re-activate at landing point: {e}");
+        return;
+    }
+    guard.chained_warp_started_at = Some(Instant::now());
 }
 
 fn handle_hud_left_button_up() {
@@ -695,6 +714,7 @@ unsafe extern "system" fn hud_wnd_proc(
                             return LRESULT(0);
                         }
                         let _ = guard.hud.update_hover_from_screen(point.x, point.y);
+                        note_chained_warp_activity(&mut guard);
                     }
                 }
             }
