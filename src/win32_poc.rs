@@ -1,11 +1,17 @@
 //! Phase 0 + PoC1: Raw Input 常駐 CLI（Windows のみ）
 
+use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime};
 
+use photon_pointer_warp::domain::adaptation::{
+    extract_best_near_miss, generate_suggestion, is_accidental_trigger, ConfigSuggestion,
+    FeedbackEvent, HudCloseReason,
+};
+use photon_pointer_warp::domain::calibration::{analyze_relative_stroke, StrokeMetrics};
 use photon_pointer_warp::domain::circle::{CircleDetector, GestureWindowStats, MotionSample};
 use photon_pointer_warp::domain::config::AppConfig;
 use photon_pointer_warp::platform::calibrate_window::CALIBRATE_MUTEX_NAME;
@@ -119,6 +125,15 @@ struct AppState {
     tray: Option<TrayIcon>,
     calibrate_child: Option<Child>,
     config_mtime: Option<SystemTime>,
+    raw_motion_history: VecDeque<(i32, i32, u64)>,
+    input_clock_ms: u64,
+    last_fire_clock_ms: Option<u64>,
+    last_trigger_metrics: Option<StrokeMetrics>,
+    feedback_events: VecDeque<FeedbackEvent>,
+    pending_suggestion: Option<ConfigSuggestion>,
+    hud_opened_at: Option<Instant>,
+    hud_opened_cursor: Option<(i32, i32)>,
+    feedback_circle_hud: bool,
 }
 
 static APP: OnceLock<Mutex<AppState>> = OnceLock::new();
@@ -283,6 +298,15 @@ pub fn run(config: AppConfig) -> io::Result<()> {
                 tray: Some(tray),
                 calibrate_child: None,
                 config_mtime: config_file_mtime(),
+                raw_motion_history: VecDeque::new(),
+                input_clock_ms: 0,
+                last_fire_clock_ms: None,
+                last_trigger_metrics: None,
+                feedback_events: VecDeque::new(),
+                pending_suggestion: None,
+                hud_opened_at: None,
+                hud_opened_cursor: None,
+                feedback_circle_hud: false,
             })
         });
 
@@ -345,13 +369,13 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_HOTKEY => {
             if wparam.0 as i32 == ESC_HOTKEY_ID {
-                dismiss_hud_with_log("escape");
+                dismiss_hud_with_log(HudCloseReason::EscapeKey);
             }
             LRESULT(0)
         }
         WM_KEYDOWN => {
             if wparam.0 == VK_ESCAPE.0 as usize {
-                dismiss_hud_with_log("escape");
+                dismiss_hud_with_log(HudCloseReason::EscapeKey);
             }
             LRESULT(0)
         }
@@ -441,6 +465,7 @@ fn enter_calibrating(state: &mut AppState) {
     if !state.hud.is_active() {
         return;
     }
+    clear_hud_feedback_clock(state);
     state.chained_warp_started_at = None;
     if let Err(e) = unsafe { state.hud.dismiss() } {
         eprintln!("HUD dismiss error: {e}");
@@ -582,9 +607,9 @@ fn flush_pending_on_idle() {
             .is_some_and(|t| chained_warp_auto_dismiss_due(t, Instant::now()));
     drop(guard);
     if should_dismiss_oob {
-        dismiss_hud_with_log("out of bounds");
+        dismiss_hud_with_log(HudCloseReason::OutOfBounds);
     } else if should_auto_timeout {
-        dismiss_hud_with_log("auto timeout");
+        dismiss_hud_with_log(HudCloseReason::AutoTimeout);
     }
 }
 
@@ -631,6 +656,7 @@ fn open_hud_after_settle(guard: &mut AppState, stats: GestureWindowStats) -> io:
         stats.net_angle_deg, stats.elapsed_ms
     );
     let _ = io::stdout().flush();
+    note_circle_hud_opened(guard);
     Ok(())
 }
 
@@ -711,7 +737,7 @@ unsafe fn handle_wm_input(lparam: LPARAM) -> io::Result<()> {
             if let Some((x, y)) = cursor_screen_pos() {
                 if guard.hud.pointer_beyond_dismiss_margin(x, y) {
                     drop(guard);
-                    dismiss_hud_with_log("out of bounds");
+                    dismiss_hud_with_log(HudCloseReason::OutOfBounds);
                     return Ok(());
                 }
                 let _ = guard.hud.update_hover_from_screen(x, y);
@@ -746,6 +772,10 @@ unsafe fn handle_wm_input(lparam: LPARAM) -> io::Result<()> {
         0
     };
 
+    if dx != 0.0 || dy != 0.0 {
+        push_motion_history(&mut guard, dx, dy, dt_millis);
+    }
+
     if let Some(ref mut pending) = guard.pending_settling {
         settling_note_motion(pending, dx, dy, now);
         if settling_ready(pending, now) {
@@ -768,6 +798,7 @@ unsafe fn handle_wm_input(lparam: LPARAM) -> io::Result<()> {
     let fired = guard.detector.push(sample);
     if fired {
         guard.pending_arc_debug = None;
+        guard.last_fire_clock_ms = Some(guard.input_clock_ms);
         let stats = guard
             .detector
             .last_detection_stats()
@@ -839,7 +870,94 @@ fn unregister_esc_hotkey_state(state: &mut AppState, message_hwnd: HWND) {
     state.esc_hotkey_registered = false;
 }
 
-fn dismiss_hud_with_log(reason: &str) {
+const MOTION_HISTORY_MS: u64 = 2000;
+const FEEDBACK_EVENT_CAP: usize = 10;
+
+fn push_motion_history(state: &mut AppState, dx: f32, dy: f32, dt_millis: u64) {
+    state.input_clock_ms = state.input_clock_ms.saturating_add(dt_millis.max(1));
+    state
+        .raw_motion_history
+        .push_back((dx.round() as i32, dy.round() as i32, state.input_clock_ms));
+    while let Some((_, _, t)) = state.raw_motion_history.front() {
+        if state.input_clock_ms.saturating_sub(*t) > MOTION_HISTORY_MS {
+            state.raw_motion_history.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+fn push_feedback_event(state: &mut AppState, event: FeedbackEvent) {
+    if state.feedback_events.len() >= FEEDBACK_EVENT_CAP {
+        state.feedback_events.pop_front();
+    }
+    state.feedback_events.push_back(event);
+    refresh_pending_suggestion(state);
+}
+
+fn refresh_pending_suggestion(state: &mut AppState) {
+    let events: Vec<FeedbackEvent> = state.feedback_events.iter().cloned().collect();
+    state.pending_suggestion = generate_suggestion(state.detector.config(), &events);
+    if let Some(suggestion) = &state.pending_suggestion {
+        eprintln!("[adapt] suggestion: {}", suggestion.summary);
+        let _ = io::stderr().flush();
+    }
+}
+
+fn stroke_metrics_ending_at(state: &AppState, end_ms: u64) -> Option<StrokeMetrics> {
+    let window = state.detector.config().window_ms;
+    let start = end_ms.saturating_sub(window);
+    let samples: Vec<(f32, f32, u64)> = state
+        .raw_motion_history
+        .iter()
+        .filter(|(_, _, t)| *t >= start && *t <= end_ms)
+        .map(|(dx, dy, t)| (*dx as f32, *dy as f32, *t))
+        .collect();
+    analyze_relative_stroke(&samples)
+}
+
+fn note_circle_hud_opened(state: &mut AppState) {
+    let success_t = state.last_fire_clock_ms.unwrap_or(state.input_clock_ms);
+    let history: Vec<(i32, i32, u64)> = state.raw_motion_history.iter().copied().collect();
+    if let Some(event) = extract_best_near_miss(&history, success_t, state.detector.config()) {
+        push_feedback_event(state, event);
+    }
+    state.last_trigger_metrics = stroke_metrics_ending_at(state, success_t);
+    state.hud_opened_at = Some(Instant::now());
+    state.hud_opened_cursor = cursor_screen_pos();
+    state.feedback_circle_hud = true;
+}
+
+fn maybe_record_accidental(state: &mut AppState, reason: HudCloseReason) {
+    if !state.feedback_circle_hud {
+        return;
+    }
+    let Some(opened_at) = state.hud_opened_at else {
+        return;
+    };
+    let Some((ox, oy)) = state.hud_opened_cursor else {
+        return;
+    };
+    let Some(metrics) = state.last_trigger_metrics.clone() else {
+        return;
+    };
+    let elapsed_ms = Instant::now()
+        .saturating_duration_since(opened_at)
+        .as_millis() as u64;
+    let (cx, cy) = cursor_screen_pos().unwrap_or((ox, oy));
+    let displacement = ((cx - ox) as f32).hypot((cy - oy) as f32);
+    if is_accidental_trigger(0, elapsed_ms, displacement, reason) {
+        push_feedback_event(state, FeedbackEvent::AccidentalTrigger { metrics });
+    }
+}
+
+fn clear_hud_feedback_clock(state: &mut AppState) {
+    state.hud_opened_at = None;
+    state.hud_opened_cursor = None;
+    state.feedback_circle_hud = false;
+}
+
+fn dismiss_hud_with_log(reason: HudCloseReason) {
     let raw = MESSAGE_HWND.load(Ordering::Acquire);
     if raw == 0 {
         return;
@@ -852,13 +970,15 @@ fn dismiss_hud_with_log(reason: &str) {
     if !guard.hud.is_active() {
         return;
     }
+    maybe_record_accidental(&mut guard, reason);
+    clear_hud_feedback_clock(&mut guard);
     guard.chained_warp_started_at = None;
     if let Err(e) = unsafe { guard.hud.dismiss() } {
         eprintln!("HUD dismiss error: {e}");
         return;
     }
     unregister_esc_hotkey_state(&mut guard, message_hwnd);
-    println!("[hud] dismissed ({reason})");
+    println!("[hud] dismissed ({})", reason.as_str());
     let _ = io::stdout().flush();
 }
 
@@ -883,6 +1003,9 @@ fn warp_hud_to_cell(col: usize, row: usize) {
         return;
     }
     guard.chained_warp_started_at = Some(Instant::now());
+    guard.hud_opened_at = Some(Instant::now());
+    guard.hud_opened_cursor = cursor_screen_pos();
+    guard.feedback_circle_hud = false;
 }
 
 fn handle_hud_left_button_up() {
@@ -899,7 +1022,7 @@ fn handle_hud_left_button_up() {
     }
     if guard.hud.origin_hit_test_screen(point.x, point.y) {
         drop(guard);
-        dismiss_hud_with_log("origin click");
+        dismiss_hud_with_log(HudCloseReason::OriginClick);
         return;
     }
     if let Some((col, row)) = guard.hud.minimap_cell_at_screen(point.x, point.y) {
@@ -908,7 +1031,7 @@ fn handle_hud_left_button_up() {
         return;
     }
     drop(guard);
-    dismiss_hud_with_log("outside click");
+    dismiss_hud_with_log(HudCloseReason::OutsideClick);
 }
 
 unsafe extern "system" fn hud_wnd_proc(
@@ -930,7 +1053,7 @@ unsafe extern "system" fn hud_wnd_proc(
                     if guard.hud.is_active() {
                         if guard.hud.pointer_beyond_dismiss_margin(point.x, point.y) {
                             drop(guard);
-                            dismiss_hud_with_log("out of bounds");
+                            dismiss_hud_with_log(HudCloseReason::OutOfBounds);
                             return LRESULT(0);
                         }
                         let _ = guard.hud.update_hover_from_screen(point.x, point.y);
@@ -945,7 +1068,7 @@ unsafe extern "system" fn hud_wnd_proc(
             LRESULT(0)
         }
         WM_RBUTTONDOWN | WM_RBUTTONUP => {
-            dismiss_hud_with_log("right click");
+            dismiss_hud_with_log(HudCloseReason::RightClick);
             LRESULT(0)
         }
         WM_DESTROY => {

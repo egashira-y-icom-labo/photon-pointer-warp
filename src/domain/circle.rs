@@ -118,6 +118,10 @@ impl CircleDetector {
         self.last_detection
     }
 
+    pub fn config(&self) -> &DetectorConfig {
+        &self.config
+    }
+
     /// 現在窓内の累積角度と、最古〜最新サンプル間の時間幅（≤ `window_ms`）。
     pub fn window_stats(&self) -> GestureWindowStats {
         let signed_angle_deg = self.cumulative_signed_angle_deg();
