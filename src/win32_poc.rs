@@ -57,6 +57,18 @@ const IDLE_FLUSH_MS: u64 = 150;
 const STROKE_GAP_MS: u64 = 100;
 const DEBUG_ARC_MIN_DEG: f32 = 180.0;
 
+/// サークル成立後、慣性が落ち着くまで HUD 展開を遅延する。
+const SETTLING_WINDOW_MS: u64 = 50;
+const SETTLING_MAX_WAIT_MS: u64 = 100;
+/// 1 サンプルあたりの移動量（|Δ|）がこれを超えたら「大きな移動」とみなす。
+const SETTLING_SPEED_THRESHOLD: f32 = 3.0;
+
+struct PendingSettling {
+    started_at: Instant,
+    last_significant_motion_at: Instant,
+    detection_stats: GestureWindowStats,
+}
+
 const CLASS_NAME: windows::core::PCWSTR = w!("PhotonPointerWarpRawInput");
 
 const RI_MOUSE_LEFT_BUTTON_DOWN: u16 = 0x0001;
@@ -73,6 +85,7 @@ struct AppState {
     pending_arc_debug: Option<(GestureWindowStats, String)>,
     hud: HudOverlay,
     esc_hotkey_registered: bool,
+    pending_settling: Option<PendingSettling>,
 }
 
 static APP: OnceLock<Mutex<AppState>> = OnceLock::new();
@@ -215,6 +228,7 @@ pub fn run() -> io::Result<()> {
                 pending_arc_debug: None,
                 hud,
                 esc_hotkey_registered: false,
+                pending_settling: None,
             })
         });
 
@@ -305,6 +319,16 @@ fn flush_pending_debug(state: &mut AppState) {
     }
 }
 
+fn cursor_screen_pos() -> Option<(i32, i32)> {
+    let mut point = POINT::default();
+    unsafe { GetCursorPos(&mut point) }.ok()?;
+    Some((point.x, point.y))
+}
+
+fn hud_pointer_out_of_bounds(hud: &HudOverlay) -> bool {
+    cursor_screen_pos().is_some_and(|(x, y)| hud.pointer_beyond_dismiss_margin(x, y))
+}
+
 fn flush_pending_on_idle() {
     let mut guard = match APP.get().and_then(|a| a.lock().ok()) {
         Some(g) => g,
@@ -317,6 +341,75 @@ fn flush_pending_on_idle() {
     if idle >= IDLE_FLUSH_MS {
         flush_pending_debug(&mut guard);
     }
+    let _ = try_finish_settling(&mut guard);
+    let should_dismiss = guard.hud.is_active() && hud_pointer_out_of_bounds(&guard.hud);
+    drop(guard);
+    if should_dismiss {
+        dismiss_hud_with_log("out of bounds");
+    }
+}
+
+fn settling_motion_significant(dx: f32, dy: f32) -> bool {
+    dx.hypot(dy) > SETTLING_SPEED_THRESHOLD
+}
+
+fn settling_note_motion(pending: &mut PendingSettling, dx: f32, dy: f32, now: Instant) {
+    if settling_motion_significant(dx, dy) {
+        pending.last_significant_motion_at = now;
+    }
+}
+
+fn settling_ready(pending: &PendingSettling, now: Instant) -> bool {
+    let elapsed_ms = now
+        .saturating_duration_since(pending.started_at)
+        .as_millis() as u64;
+    let quiet_ms = now
+        .saturating_duration_since(pending.last_significant_motion_at)
+        .as_millis() as u64;
+    if elapsed_ms >= SETTLING_MAX_WAIT_MS {
+        return true;
+    }
+    if quiet_ms >= SETTLING_WINDOW_MS {
+        return true;
+    }
+    false
+}
+
+fn open_hud_after_settle(guard: &mut AppState, stats: GestureWindowStats) -> io::Result<()> {
+    let message_hwnd = HWND(MESSAGE_HWND.load(Ordering::Acquire) as _);
+    let hud_diag = unsafe {
+        guard
+            .hud
+            .activate_at_cursor()
+            .map_err(|e| io::Error::other(format!("HUD activate: {e}")))?
+    };
+    let dpi = unsafe { GetDpiForSystem() };
+    println!("{}", hud_diag.format_line(dpi));
+    let _ = io::stdout().flush();
+    unsafe { register_esc_hotkey_if_needed(message_hwnd, guard)? };
+    println!(
+        "[detect] Circle gesture - {:.0}deg in {}ms (HUD open; click cell to warp)",
+        stats.net_angle_deg, stats.elapsed_ms
+    );
+    let _ = io::stdout().flush();
+    Ok(())
+}
+
+fn try_finish_settling(guard: &mut AppState) -> io::Result<()> {
+    let now = Instant::now();
+    let should_open = guard
+        .pending_settling
+        .as_ref()
+        .is_some_and(|p| settling_ready(p, now));
+    if !should_open {
+        return Ok(());
+    }
+    let stats = guard
+        .pending_settling
+        .take()
+        .expect("pending_settling")
+        .detection_stats;
+    open_hud_after_settle(guard, stats)
 }
 
 fn update_pending_arc_debug(state: &mut AppState) {
@@ -374,6 +467,18 @@ unsafe fn handle_wm_input(lparam: LPARAM) -> io::Result<()> {
         .expect("APP mutex poisoned");
 
     if guard.hud.is_active() {
+        let dx = mouse.lLastX as f32;
+        let dy = mouse.lLastY as f32;
+        if dx != 0.0 || dy != 0.0 {
+            if let Some((x, y)) = cursor_screen_pos() {
+                if guard.hud.pointer_beyond_dismiss_margin(x, y) {
+                    drop(guard);
+                    dismiss_hud_with_log("out of bounds");
+                    return Ok(());
+                }
+                let _ = guard.hud.update_hover_from_screen(x, y);
+            }
+        }
         return Ok(());
     }
 
@@ -381,19 +486,34 @@ unsafe fn handle_wm_input(lparam: LPARAM) -> io::Result<()> {
 
     let dx = mouse.lLastX as f32;
     let dy = mouse.lLastY as f32;
-    if dx == 0.0 && dy == 0.0 {
+    let now = Instant::now();
+
+    let dt_millis = if dx != 0.0 || dy != 0.0 {
+        let dt = guard
+            .last_input_at
+            .map(|t| now.saturating_duration_since(t).as_millis() as u64)
+            .unwrap_or(0);
+        guard.last_input_at = Some(now);
+        if dt >= STROKE_GAP_MS {
+            flush_pending_debug(&mut guard);
+            guard.pending_settling = None;
+        }
+        dt
+    } else {
+        0
+    };
+
+    if let Some(ref mut pending) = guard.pending_settling {
+        settling_note_motion(pending, dx, dy, now);
+        if settling_ready(pending, now) {
+            let stats = guard.pending_settling.take().unwrap().detection_stats;
+            open_hud_after_settle(&mut guard, stats)?;
+        }
         return Ok(());
     }
 
-    let now = Instant::now();
-    let dt_millis = guard
-        .last_input_at
-        .map(|t| now.saturating_duration_since(t).as_millis() as u64)
-        .unwrap_or(0);
-    guard.last_input_at = Some(now);
-
-    if dt_millis >= STROKE_GAP_MS {
-        flush_pending_debug(&mut guard);
+    if dx == 0.0 && dy == 0.0 {
+        return Ok(());
     }
 
     let sample = MotionSample {
@@ -409,23 +529,11 @@ unsafe fn handle_wm_input(lparam: LPARAM) -> io::Result<()> {
             .detector
             .last_detection_stats()
             .unwrap_or_else(|| guard.detector.window_stats());
-        let message_hwnd = HWND(MESSAGE_HWND.load(Ordering::Acquire) as _);
-        let hud_diag = guard
-            .hud
-            .activate_at_cursor()
-            .map_err(|e| io::Error::other(format!("HUD activate: {e}")))?;
-        let dpi = unsafe { GetDpiForSystem() };
-        println!("{}", hud_diag.format_line(dpi));
-        let _ = io::stdout().flush();
-        let mut cursor = POINT::default();
-        let _ = GetCursorPos(&mut cursor);
-        let _ = guard.hud.update_hover_from_screen(cursor.x, cursor.y);
-        register_esc_hotkey_if_needed(message_hwnd, &mut guard)?;
-        println!(
-            "[detect] Circle gesture - {:.0}deg in {}ms (HUD open; click cell to warp)",
-            stats.net_angle_deg, stats.elapsed_ms
-        );
-        let _ = io::stdout().flush();
+        guard.pending_settling = Some(PendingSettling {
+            started_at: now,
+            last_significant_motion_at: now,
+            detection_stats: stats,
+        });
     } else {
         update_pending_arc_debug(&mut guard);
     }
@@ -581,6 +689,11 @@ unsafe extern "system" fn hud_wnd_proc(
             if GetCursorPos(&mut point).is_ok() {
                 if let Some(mut guard) = APP.get().and_then(|a| a.lock().ok()) {
                     if guard.hud.is_active() {
+                        if guard.hud.pointer_beyond_dismiss_margin(point.x, point.y) {
+                            drop(guard);
+                            dismiss_hud_with_log("out of bounds");
+                            return LRESULT(0);
+                        }
                         let _ = guard.hud.update_hover_from_screen(point.x, point.y);
                     }
                 }

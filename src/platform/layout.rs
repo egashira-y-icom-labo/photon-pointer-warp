@@ -7,6 +7,28 @@ pub const MINIMAP_PANEL_PX: i32 = 180;
 pub const MINIMAP_CELL_PX: i32 = MINIMAP_PANEL_PX / MINIMAP_GRID as i32;
 /// 地縛霊クリックキャンセル半径（px）
 pub const ORIGIN_CANCEL_RADIUS_PX: i32 = 15;
+/// ミニマップ外れ自動 dismiss 用の拡張マージン（px）。パネル 180 + 両側 50 → 280 相当。
+pub const DISMISS_OUT_OF_BOUNDS_MARGIN_PX: i32 = 50;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PanelScreenRect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+/// パネル矩形を `margin` だけ外側に広げた領域の外にカーソルがあるか。
+pub fn is_pointer_out_of_bounds(
+    cursor: (i32, i32),
+    panel: PanelScreenRect,
+    margin: i32,
+) -> bool {
+    cursor.0 < panel.left - margin
+        || cursor.0 > panel.right + margin
+        || cursor.1 < panel.top - margin
+        || cursor.1 > panel.bottom + margin
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtualScreen {
@@ -212,5 +234,25 @@ mod tests {
     fn origin_cancel_radius_constant() {
         assert_eq!(ORIGIN_CANCEL_RADIUS_PX, 15);
         assert_eq!(MINIMAP_CELL_PX, 60);
+        assert_eq!(DISMISS_OUT_OF_BOUNDS_MARGIN_PX, 50);
+    }
+
+    #[test]
+    fn dismiss_out_of_bounds_margin() {
+        let panel = PanelScreenRect {
+            left: 100,
+            top: 100,
+            right: 280,
+            bottom: 280,
+        };
+        let margin = DISMISS_OUT_OF_BOUNDS_MARGIN_PX;
+
+        assert!(!is_pointer_out_of_bounds((150, 150), panel, margin));
+
+        assert!(!is_pointer_out_of_bounds((80, 150), panel, margin));
+        assert!(!is_pointer_out_of_bounds((300, 150), panel, margin));
+
+        assert!(is_pointer_out_of_bounds((39, 150), panel, margin));
+        assert!(is_pointer_out_of_bounds((341, 150), panel, margin));
     }
 }

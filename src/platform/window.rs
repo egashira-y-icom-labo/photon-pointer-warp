@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 use crate::platform::layout::{
     minimap_anchor_layout, minimap_cell_at, point_within_radius, VirtualScreen,
     MINIMAP_CELL_PX, MINIMAP_GRID, MINIMAP_PANEL_PX, ORIGIN_CANCEL_RADIUS_PX,
+    DISMISS_OUT_OF_BOUNDS_MARGIN_PX, PanelScreenRect, is_pointer_out_of_bounds,
 };
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -15,8 +16,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, GetSystemMetrics, LoadCursorW, RegisterClassW, SetCursor, SetWindowPos,
-    ShowWindow, UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, HCURSOR, IDC_ARROW, HWND_TOPMOST,
+    CreateWindowExW, GetSystemMetrics, LoadCursorW, RegisterClassW, SetCursor, SetCursorPos,
+    SetWindowPos, ShowWindow, UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, HCURSOR, IDC_ARROW, HWND_TOPMOST,
     SM_CYVIRTUALSCREEN, SM_CXVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE,
     SW_SHOWNOACTIVATE, ULW_ALPHA, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
@@ -217,6 +218,9 @@ impl HudOverlay {
         );
         let _ = SetCapture(self.hwnd);
         set_arrow_cursor();
+        SetCursorPos(self.pin_screen.x, self.pin_screen.y)
+            .map_err(|e| io::Error::other(format!("SetCursorPos snap: {e}")))?;
+        self.update_hover_from_screen(self.pin_screen.x, self.pin_screen.y)?;
         self.active = true;
         Ok(self.activation_diagnostic())
     }
@@ -276,6 +280,19 @@ impl HudOverlay {
             self.panel_screen.left,
             self.panel_screen.top,
             MINIMAP_PANEL_PX,
+        )
+    }
+
+    pub fn pointer_beyond_dismiss_margin(&self, screen_x: i32, screen_y: i32) -> bool {
+        is_pointer_out_of_bounds(
+            (screen_x, screen_y),
+            PanelScreenRect {
+                left: self.panel_screen.left,
+                top: self.panel_screen.top,
+                right: self.panel_screen.right,
+                bottom: self.panel_screen.bottom,
+            },
+            DISMISS_OUT_OF_BOUNDS_MARGIN_PX,
         )
     }
 
