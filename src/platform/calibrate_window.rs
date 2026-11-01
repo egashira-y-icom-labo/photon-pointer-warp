@@ -5,18 +5,20 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::domain::calibration::{
-    analyze_relative_stroke, is_usable_calibration_stroke, recommend_detector_config,
-    should_finalize_idle_stroke, StrokeMetrics,
+    analyze_relative_stroke, center_path_on_bounds, is_usable_calibration_stroke,
+    recommend_detector_config, CalibrateGate, CalibrateGateAction, CalibratePhase, StrokeMetrics,
 };
 use crate::domain::circle::DetectorConfig;
 use crate::domain::config::AppConfig;
 use windows::core::w;
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, InvalidateRect,
-    LineTo, MoveToEx, SelectObject, SetBkMode, SetTextColor, DEFAULT_CHARSET, DT_CENTER,
-    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_WORDBREAK, FW_NORMAL, HDC,
+    LineTo, MoveToEx, ScreenToClient, SelectObject, SetBkMode, SetTextColor, DEFAULT_CHARSET,
+    DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_WORDBREAK, FW_NORMAL, HDC,
     PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -30,11 +32,11 @@ use windows::Win32::UI::Input::{
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetMessageW, GetSystemMetrics, KillTimer, LoadCursorW, PostQuitMessage,
-    RegisterClassW, SetTimer, ShowWindow, TranslateMessage, CS_HREDRAW, CS_OWNDC, CS_VREDRAW,
-    HMENU, IDC_ARROW, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_DESTROY,
-    WM_ERASEBKGND, WM_INPUT, WM_PAINT, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX,
-    WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    GetClientRect, GetCursorPos, GetMessageW, GetSystemMetrics, KillTimer, LoadCursorW,
+    PostQuitMessage, RegisterClassW, SetTimer, ShowWindow, TranslateMessage, CS_HREDRAW, CS_OWNDC,
+    CS_VREDRAW, HMENU, IDC_ARROW, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, WM_CLOSE, WM_COMMAND,
+    WM_DESTROY, WM_ERASEBKGND, WM_INPUT, WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WNDCLASSW, WS_CAPTION,
+    WS_CHILD, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
 const CLASS_NAME: windows::core::PCWSTR = w!("PhotonPointerWarpCalibrate");
@@ -47,7 +49,7 @@ const TIMER_MS: u32 = 50;
 const IDC_RESET: i32 = 101;
 const IDC_SAVE: i32 = 102;
 const IDC_CANCEL: i32 = 103;
-const MAX_STROKES: usize = 5;
+const RECENT_LIST: usize = 5;
 
 const COLOR_BG: (u8, u8, u8) = (30, 30, 30);
 const COLOR_CANVAS: (u8, u8, u8) = (24, 24, 24);
@@ -55,7 +57,8 @@ const COLOR_TEXT: (u8, u8, u8) = (220, 220, 220);
 const COLOR_DIM: (u8, u8, u8) = (140, 140, 140);
 const COLOR_LINE: (u8, u8, u8) = (80, 210, 230);
 const COLOR_FADE: (u8, u8, u8) = (50, 90, 100);
-const COLOR_FRAME: (u8, u8, u8) = (70, 70, 70);
+const COLOR_FRAME_IDLE: (u8, u8, u8) = (51, 51, 51);
+const COLOR_FRAME_READY: (u8, u8, u8) = (0, 255, 255);
 
 static STATE: OnceLock<Mutex<CalibrateState>> = OnceLock::new();
 
@@ -68,9 +71,11 @@ struct CalibrateState {
     last_input_at: Option<Instant>,
     accepted: Vec<StrokeMetrics>,
     last_path: Vec<(f32, f32)>,
+    record_origin: Option<(i32, i32)>,
     recommended: Option<DetectorConfig>,
     recommend_error: Option<&'static str>,
     save_hwnd: HWND,
+    gate: CalibrateGate,
 }
 
 impl CalibrateState {
@@ -83,8 +88,10 @@ impl CalibrateState {
         self.last_input_at = None;
         self.accepted.clear();
         self.last_path.clear();
+        self.record_origin = None;
         self.recommended = None;
         self.recommend_error = None;
+        self.gate.reset();
     }
 
     fn refresh_recommendation(&mut self) {
@@ -200,9 +207,11 @@ pub fn run() -> io::Result<()> {
                 last_input_at: None,
                 accepted: Vec::new(),
                 last_path: Vec::new(),
+                record_origin: None,
                 recommended: None,
                 recommend_error: None,
                 save_hwnd,
+                gate: CalibrateGate::new(),
             })
         });
 
@@ -211,7 +220,7 @@ pub fn run() -> io::Result<()> {
         let _ = ShowWindow(hwnd, SW_SHOW);
 
         println!("=== photon-pointer-warp calibrate ===");
-        println!("Draw 3-5 circles, then Save. Close without Save to cancel.");
+        println!("Wait for cyan Ready, then draw circles. Save after 3 or more.");
         let _ = io::Write::flush(&mut io::stdout());
 
         let mut msg = MSG::default();
@@ -282,9 +291,13 @@ unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
+        WM_MOUSEMOVE => {
+            apply_gate(hwnd, None);
+            LRESULT(0)
+        }
         WM_TIMER => {
             if wparam.0 == TIMER_ID {
-                poll_idle_finalize(hwnd);
+                apply_gate(hwnd, None);
             }
             LRESULT(0)
         }
@@ -347,56 +360,127 @@ unsafe fn handle_wm_input(hwnd: HWND, lparam: LPARAM) -> io::Result<()> {
     let dx = raw.data.mouse.lLastX as f32;
     let dy = raw.data.mouse.lLastY as f32;
     if dx == 0.0 && dy == 0.0 {
+        apply_gate(hwnd, None);
         return Ok(());
     }
-
-    if let Some(mut g) = STATE.get().and_then(|s| s.lock().ok()) {
-        if g.accepted.len() >= MAX_STROKES {
-            return Ok(());
-        }
-        let t = g.now_ms();
-        g.current.push((dx, dy, t));
-        g.last_input_at = Some(Instant::now());
-    }
-    let _ = InvalidateRect(hwnd, None, false);
+    apply_gate(hwnd, Some((dx, dy)));
     Ok(())
 }
 
-fn poll_idle_finalize(hwnd: HWND) {
+fn canvas_rect_for_width(client_w: i32) -> RECT {
+    let left = (client_w - CANVAS_SIZE) / 2;
+    RECT {
+        left,
+        top: CANVAS_TOP,
+        right: left + CANVAS_SIZE,
+        bottom: CANVAS_TOP + CANVAS_SIZE,
+    }
+}
+
+unsafe fn cursor_in_canvas(hwnd: HWND) -> bool {
+    let mut client = RECT::default();
+    if GetClientRect(hwnd, &mut client).is_err() {
+        return false;
+    }
+    let canvas = canvas_rect_for_width(client.right);
+    let mut pt = POINT::default();
+    if GetCursorPos(&mut pt).is_err() {
+        return false;
+    }
+    if !ScreenToClient(hwnd, &mut pt).as_bool() {
+        return false;
+    }
+    pt.x >= canvas.left && pt.x < canvas.right && pt.y >= canvas.top && pt.y < canvas.bottom
+}
+
+unsafe fn cursor_client_pos(hwnd: HWND) -> Option<(i32, i32)> {
+    let mut pt = POINT::default();
+    GetCursorPos(&mut pt).ok()?;
+    if !ScreenToClient(hwnd, &mut pt).as_bool() {
+        return None;
+    }
+    Some((pt.x, pt.y))
+}
+
+fn apply_gate(hwnd: HWND, motion: Option<(f32, f32)>) {
+    let inside = unsafe { cursor_in_canvas(hwnd) };
     let mut guard = match STATE.get().and_then(|s| s.lock().ok()) {
         Some(g) => g,
         None => return,
     };
-    let idle = guard
-        .last_input_at
-        .map(|t| t.elapsed().as_millis() as u64)
-        .unwrap_or(0);
-    if !should_finalize_idle_stroke(idle, guard.current.len()) {
+    let now = Instant::now();
+    let mut dirty = false;
+    if !inside {
+        if guard.gate.phase != CalibratePhase::Outside {
+            guard.gate.note_outside();
+            guard.current.clear();
+            guard.record_origin = None;
+            dirty = true;
+        }
+        drop(guard);
+        if dirty {
+            unsafe {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+        }
         return;
     }
-    let stroke = std::mem::take(&mut guard.current);
-    guard.last_input_at = None;
-    if let Some(metrics) = analyze_relative_stroke(&stroke) {
-        if is_usable_calibration_stroke(&metrics) && guard.accepted.len() < MAX_STROKES {
-            guard.last_path = integrate_path(&stroke);
-            guard.accepted.push(metrics);
-            guard.refresh_recommendation();
+
+    let prev = guard.gate.phase;
+    let action = guard.gate.note_inside(now, motion);
+    if prev != guard.gate.phase {
+        dirty = true;
+    }
+    match action {
+        CalibrateGateAction::Ignore => {}
+        CalibrateGateAction::StartRecording => {
+            guard.current.clear();
+            guard.record_origin = unsafe { cursor_client_pos(hwnd) };
+            if let Some((dx, dy)) = motion {
+                let t = guard.now_ms();
+                guard.current.push((dx, dy, t));
+                guard.last_input_at = Some(now);
+            }
+            dirty = true;
+        }
+        CalibrateGateAction::Record => {
+            if let Some((dx, dy)) = motion {
+                let t = guard.now_ms();
+                guard.current.push((dx, dy, t));
+                guard.last_input_at = Some(now);
+            }
+            dirty = true;
+        }
+        CalibrateGateAction::Finalize => {
+            let stroke = std::mem::take(&mut guard.current);
+            guard.last_input_at = None;
+            guard.record_origin = None;
+            if let Some(metrics) = analyze_relative_stroke(&stroke) {
+                if is_usable_calibration_stroke(&metrics) {
+                    guard.last_path = center_path_on_bounds(&integrate_path(&stroke));
+                    guard.accepted.push(metrics);
+                    guard.refresh_recommendation();
+                } else {
+                    guard.last_path.clear();
+                }
+            } else {
+                guard.last_path.clear();
+            }
             let can_save = guard.recommended.is_some();
             let save_hwnd = guard.save_hwnd;
             drop(guard);
             unsafe {
                 let _ = EnableWindow(save_hwnd, can_save);
-            }
-            unsafe {
                 let _ = InvalidateRect(hwnd, None, false);
             }
             return;
         }
     }
-    guard.last_path.clear();
     drop(guard);
-    unsafe {
-        let _ = InvalidateRect(hwnd, None, false);
+    if dirty {
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
+        }
     }
 }
 
@@ -503,22 +587,26 @@ unsafe fn paint_contents(hdc: HDC, state: &CalibrateState, client_w: i32) {
         14,
         client_w - 40,
         52,
-        "トラックボールで普段の感覚のサークルを 3〜5 回描いてください",
+        "キャンバス内で止まって枠がシアンになったら、普段の感覚で回してください",
         true,
     );
 
-    let canvas_l = (client_w - CANVAS_SIZE) / 2;
-    let canvas_t = CANVAS_TOP;
-    let canvas = RECT {
-        left: canvas_l,
-        top: canvas_t,
-        right: canvas_l + CANVAS_SIZE,
-        bottom: canvas_t + CANVAS_SIZE,
-    };
+    let canvas = canvas_rect_for_width(client_w);
     let canvas_brush = CreateSolidBrush(rgb(COLOR_CANVAS));
     FillRect(hdc, &canvas, canvas_brush);
     let _ = DeleteObject(canvas_brush);
-    let frame = CreatePen(PS_SOLID, 1, rgb(COLOR_FRAME));
+
+    let ready = matches!(
+        state.gate.phase,
+        CalibratePhase::Ready | CalibratePhase::Recording
+    );
+    let frame_color = if ready {
+        COLOR_FRAME_READY
+    } else {
+        COLOR_FRAME_IDLE
+    };
+    let frame_w = if ready { 2 } else { 1 };
+    let frame = CreatePen(PS_SOLID, frame_w, rgb(frame_color));
     let old_pen = SelectObject(hdc, frame);
     let _ = MoveToEx(hdc, canvas.left, canvas.top, None);
     let _ = LineTo(hdc, canvas.right - 1, canvas.top);
@@ -528,12 +616,31 @@ unsafe fn paint_contents(hdc: HDC, state: &CalibrateState, client_w: i32) {
     SelectObject(hdc, old_pen);
     let _ = DeleteObject(frame);
 
-    if !state.last_path.is_empty() {
-        stroke_polyline(hdc, &canvas, &state.last_path, COLOR_FADE, 1);
+    if state.gate.phase == CalibratePhase::Ready {
+        SetTextColor(hdc, rgb(COLOR_FRAME_READY));
+        draw_text(
+            hdc,
+            canvas.left + 8,
+            canvas.top + 10,
+            CANVAS_SIZE - 16,
+            40,
+            "Ready: 自由な場所・向きで回してください",
+            true,
+        );
     }
-    let live = integrate_path(&state.current);
-    if live.len() > 1 {
-        stroke_polyline(hdc, &canvas, &live, COLOR_LINE, 2);
+
+    if !state.last_path.is_empty() && state.gate.phase != CalibratePhase::Recording {
+        stroke_polyline_centered(hdc, &canvas, &state.last_path, COLOR_FADE, 1);
+    }
+    if state.gate.phase == CalibratePhase::Recording {
+        let live = integrate_path(&state.current);
+        if live.len() > 1 {
+            let origin = state.record_origin.unwrap_or((
+                (canvas.left + canvas.right) / 2,
+                (canvas.top + canvas.bottom) / 2,
+            ));
+            stroke_polyline_from_origin(hdc, &canvas, origin, &live, COLOR_LINE, 2);
+        }
     }
 
     let list_top = canvas.bottom + 14;
@@ -544,22 +651,24 @@ unsafe fn paint_contents(hdc: HDC, state: &CalibrateState, client_w: i32) {
         list_top,
         client_w - 48,
         22,
-        &format!("Samples: {}/{MAX_STROKES}", state.accepted.len()),
+        &format!(
+            "Samples: {} 回記録済み（納得いくまで回せます）",
+            state.accepted.len()
+        ),
         false,
     );
     SetTextColor(hdc, rgb(COLOR_DIM));
-    for (i, m) in state.accepted.iter().enumerate() {
+    let start = state.accepted.len().saturating_sub(RECENT_LIST);
+    for (offset, m) in state.accepted[start..].iter().enumerate() {
+        let n = start + offset + 1;
         let line = format!(
             "#{}: {}ms | {:.0}° | aspect {:.1}",
-            i + 1,
-            m.elapsed_ms,
-            m.net_angle_deg,
-            m.aspect_ratio
+            n, m.elapsed_ms, m.net_angle_deg, m.aspect_ratio
         );
         draw_text(
             hdc,
             24,
-            list_top + 24 + i as i32 * 20,
+            list_top + 24 + offset as i32 * 20,
             client_w - 48,
             20,
             &line,
@@ -595,7 +704,35 @@ fn recommend_error_ja(reason: &str) -> &'static str {
     }
 }
 
-unsafe fn stroke_polyline(
+unsafe fn stroke_polyline_from_origin(
+    hdc: HDC,
+    canvas: &RECT,
+    origin: (i32, i32),
+    path: &[(f32, f32)],
+    color: (u8, u8, u8),
+    width: i32,
+) {
+    if path.len() < 2 {
+        return;
+    }
+    let pen = CreatePen(PS_SOLID, width, rgb(color));
+    let old = SelectObject(hdc, pen);
+    let mut first = true;
+    for (x, y) in path {
+        let px = (origin.0 + x.round() as i32).clamp(canvas.left + 2, canvas.right - 3);
+        let py = (origin.1 + y.round() as i32).clamp(canvas.top + 2, canvas.bottom - 3);
+        if first {
+            let _ = MoveToEx(hdc, px, py, None);
+            first = false;
+        } else {
+            let _ = LineTo(hdc, px, py);
+        }
+    }
+    SelectObject(hdc, old);
+    let _ = DeleteObject(pen);
+}
+
+unsafe fn stroke_polyline_centered(
     hdc: HDC,
     canvas: &RECT,
     path: &[(f32, f32)],
@@ -616,10 +753,8 @@ unsafe fn stroke_polyline(
     let old = SelectObject(hdc, pen);
     let mut first = true;
     for (x, y) in path {
-        let px = cx + (*x * scale).round() as i32;
-        let py = cy + (*y * scale).round() as i32;
-        let px = px.clamp(canvas.left + 2, canvas.right - 3);
-        let py = py.clamp(canvas.top + 2, canvas.bottom - 3);
+        let px = (cx + (*x * scale).round() as i32).clamp(canvas.left + 2, canvas.right - 3);
+        let py = (cy + (*y * scale).round() as i32).clamp(canvas.top + 2, canvas.bottom - 3);
         if first {
             let _ = MoveToEx(hdc, px, py, None);
             first = false;
@@ -629,7 +764,6 @@ unsafe fn stroke_polyline(
     }
     SelectObject(hdc, old);
     let _ = DeleteObject(pen);
-    let _ = first;
 }
 
 unsafe fn draw_text(hdc: HDC, x: i32, y: i32, w: i32, h: i32, text: &str, center: bool) {

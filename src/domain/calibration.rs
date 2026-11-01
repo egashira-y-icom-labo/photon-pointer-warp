@@ -7,7 +7,6 @@ use super::circle::{
 
 const MIN_SAMPLES: usize = 3;
 const MIN_STROKES: usize = 3;
-const MAX_STROKES: usize = 5;
 const WINDOW_MARGIN: f32 = 1.35;
 const WINDOW_MIN_MS: u64 = 400;
 const WINDOW_MAX_MS: u64 = 900;
@@ -29,6 +28,10 @@ const MAX_ELAPSED_CV: f32 = 0.45;
 const DIRECTION_EPS_DEG: f32 = 8.0;
 /// キャリブレーションでストローク確定とみなす無入力時間。
 pub const CALIBRATION_STROKE_IDLE_MS: u64 = 350;
+/// キャンバス進入後、Ready に入るための静止時間。
+pub const CALIBRATION_READY_STILL_MS: u64 = 200;
+/// 1 サンプルあたりの移動量がこれを超えたら「有意な移動」。
+pub const CALIBRATION_SIGNIFICANT_MOVE: f32 = 3.0;
 const USABLE_MIN_NET_ANGLE_DEG: f32 = 120.0;
 const USABLE_MIN_RMS: f32 = 8.0;
 const USABLE_MIN_ELAPSED_MS: u64 = 80;
@@ -137,13 +140,149 @@ pub fn should_finalize_idle_stroke(idle_ms: u64, point_count: usize) -> bool {
     point_count >= MIN_SAMPLES && idle_ms >= CALIBRATION_STROKE_IDLE_MS
 }
 
-/// 3〜5 本の有効ストロークから推奨 `DetectorConfig` を導出する。
+pub fn motion_is_significant(dx: f32, dy: f32) -> bool {
+    dx.hypot(dy) > CALIBRATION_SIGNIFICANT_MOVE
+}
+
+/// バウンディングボックス中心が原点になるよう平行移動する。
+pub fn center_path_on_bounds(path: &[(f32, f32)]) -> Vec<(f32, f32)> {
+    if path.is_empty() {
+        return Vec::new();
+    }
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for &(x, y) in path {
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+    let cx = (min_x + max_x) * 0.5;
+    let cy = (min_y + max_y) * 0.5;
+    path.iter().map(|&(x, y)| (x - cx, y - cy)).collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalibratePhase {
+    Outside,
+    Positioning,
+    Ready,
+    Recording,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalibrateGateAction {
+    Ignore,
+    /// バッファを空にしてからこの移動を Recording に入れる。
+    StartRecording,
+    Record,
+    Finalize,
+}
+
+/// キャンバス内外と静止待機を管理する純 Rust ゲート。
+#[derive(Debug, Clone)]
+pub struct CalibrateGate {
+    pub phase: CalibratePhase,
+    last_significant_at: Option<std::time::Instant>,
+    last_motion_at: Option<std::time::Instant>,
+}
+
+impl Default for CalibrateGate {
+    fn default() -> Self {
+        Self {
+            phase: CalibratePhase::Outside,
+            last_significant_at: None,
+            last_motion_at: None,
+        }
+    }
+}
+
+impl CalibrateGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn note_outside(&mut self) {
+        self.phase = CalibratePhase::Outside;
+        self.last_significant_at = None;
+        self.last_motion_at = None;
+    }
+
+    /// カーソルがキャンバス内。`motion` は Raw Input の `(dx, dy)`。ティックは `None`。
+    pub fn note_inside(
+        &mut self,
+        now: std::time::Instant,
+        motion: Option<(f32, f32)>,
+    ) -> CalibrateGateAction {
+        if self.phase == CalibratePhase::Outside {
+            self.phase = CalibratePhase::Positioning;
+            self.last_significant_at = Some(now);
+            self.last_motion_at = Some(now);
+            return CalibrateGateAction::Ignore;
+        }
+
+        let any_move = motion.is_some_and(|(dx, dy)| dx != 0.0 || dy != 0.0);
+        let significant = motion.is_some_and(|(dx, dy)| motion_is_significant(dx, dy));
+        if significant {
+            self.last_significant_at = Some(now);
+        }
+        if any_move {
+            self.last_motion_at = Some(now);
+        }
+
+        match self.phase {
+            CalibratePhase::Outside => CalibrateGateAction::Ignore,
+            CalibratePhase::Positioning => {
+                if self.still_ms(now) >= CALIBRATION_READY_STILL_MS {
+                    self.phase = CalibratePhase::Ready;
+                }
+                CalibrateGateAction::Ignore
+            }
+            CalibratePhase::Ready => {
+                if any_move {
+                    self.phase = CalibratePhase::Recording;
+                    return CalibrateGateAction::StartRecording;
+                }
+                CalibrateGateAction::Ignore
+            }
+            CalibratePhase::Recording => {
+                if any_move {
+                    return CalibrateGateAction::Record;
+                }
+                if self.idle_ms(now) >= CALIBRATION_STROKE_IDLE_MS {
+                    self.phase = CalibratePhase::Positioning;
+                    self.last_significant_at = Some(now);
+                    self.last_motion_at = None;
+                    return CalibrateGateAction::Finalize;
+                }
+                CalibrateGateAction::Ignore
+            }
+        }
+    }
+
+    fn still_ms(&self, now: std::time::Instant) -> u64 {
+        self.last_significant_at
+            .map(|t| now.saturating_duration_since(t).as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn idle_ms(&self, now: std::time::Instant) -> u64 {
+        self.last_motion_at
+            .map(|t| now.saturating_duration_since(t).as_millis() as u64)
+            .unwrap_or(0)
+    }
+}
+
+/// 3 本以上の有効ストロークから推奨 `DetectorConfig` を導出する（上限なし）。
 pub fn recommend_detector_config(strokes: &[StrokeMetrics]) -> Result<DetectorConfig, &'static str> {
     if strokes.len() < MIN_STROKES {
         return Err("too_few_strokes");
-    }
-    if strokes.len() > MAX_STROKES {
-        return Err("too_many_strokes");
     }
 
     let direction = strokes[0].direction;
@@ -318,6 +457,13 @@ mod tests {
     }
 
     #[test]
+    fn center_path_on_bounds_moves_bbox_midpoint_to_origin() {
+        let path = [(10.0, 0.0), (30.0, 0.0), (30.0, 20.0), (10.0, 20.0)];
+        let centered = center_path_on_bounds(&path);
+        assert_eq!(centered, [(-10.0, -10.0), (10.0, -10.0), (10.0, 10.0), (-10.0, 10.0)]);
+    }
+
+    #[test]
     fn usable_stroke_accepts_circle_rejects_line() {
         let circle = circle_metrics();
         assert!(is_usable_calibration_stroke(&circle));
@@ -399,16 +545,64 @@ mod tests {
     }
 
     #[test]
-    fn recommend_rejects_too_few_and_too_many() {
+    fn recommend_rejects_too_few_but_allows_more_than_five() {
         let one = circle_metrics();
         assert_eq!(
             recommend_detector_config(&[one, one]).unwrap_err(),
             "too_few_strokes"
         );
+        let many = [one; 7];
+        assert!(recommend_detector_config(&many).is_ok());
+    }
+
+    #[test]
+    fn calibrate_gate_ignores_entry_then_waits_for_stillness() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut gate = CalibrateGate::new();
+        assert_eq!(gate.phase, CalibratePhase::Outside);
+
         assert_eq!(
-            recommend_detector_config(&[one, one, one, one, one, one]).unwrap_err(),
-            "too_many_strokes"
+            gate.note_inside(t0, Some((12.0, 0.0))),
+            CalibrateGateAction::Ignore
         );
+        assert_eq!(gate.phase, CalibratePhase::Positioning);
+
+        assert_eq!(
+            gate.note_inside(t0 + Duration::from_millis(80), Some((8.0, 0.0))),
+            CalibrateGateAction::Ignore
+        );
+        assert_eq!(gate.phase, CalibratePhase::Positioning);
+
+        assert_eq!(
+            gate.note_inside(t0 + Duration::from_millis(280), None),
+            CalibrateGateAction::Ignore
+        );
+        assert_eq!(gate.phase, CalibratePhase::Ready);
+
+        assert_eq!(
+            gate.note_inside(t0 + Duration::from_millis(290), Some((4.0, 1.0))),
+            CalibrateGateAction::StartRecording
+        );
+        assert_eq!(gate.phase, CalibratePhase::Recording);
+
+        assert_eq!(
+            gate.note_inside(t0 + Duration::from_millis(300), Some((3.0, 2.0))),
+            CalibrateGateAction::Record
+        );
+        assert_eq!(
+            gate.note_inside(t0 + Duration::from_millis(660), None),
+            CalibrateGateAction::Finalize
+        );
+        assert_eq!(gate.phase, CalibratePhase::Positioning);
+
+        gate.note_outside();
+        assert_eq!(gate.phase, CalibratePhase::Outside);
+        assert_eq!(
+            gate.note_inside(t0 + Duration::from_millis(700), Some((20.0, 0.0))),
+            CalibrateGateAction::Ignore
+        );
+        assert_eq!(gate.phase, CalibratePhase::Positioning);
     }
 
     #[test]
