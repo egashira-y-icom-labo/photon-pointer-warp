@@ -9,6 +9,11 @@ pub const MINIMAP_CELL_PX: i32 = MINIMAP_PANEL_PX / MINIMAP_GRID as i32;
 pub const ORIGIN_CANCEL_RADIUS_PX: i32 = 15;
 /// ミニマップ外れ自動 dismiss 用の拡張マージン（px）。パネル 180 + 両側 50 → 280 相当。
 pub const DISMISS_OUT_OF_BOUNDS_MARGIN_PX: i32 = 50;
+/// 提案ヒントをパネル下端から離す距離（描画専用、ヒットテスト非使用）。
+pub const SUGGESTION_HINT_BELOW_GAP_PX: i32 = 10;
+/// 下にはみ出すときの上側ギャップ。
+pub const SUGGESTION_HINT_ABOVE_GAP_PX: i32 = 20;
+pub const SUGGESTION_HINT_HEIGHT_PX: i32 = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PanelScreenRect {
@@ -19,6 +24,29 @@ pub struct PanelScreenRect {
 }
 
 /// パネル矩形を `margin` だけ外側に広げた領域の外にカーソルがあるか。
+/// 提案ヒントの画面矩形。セル幾何には使わない。下に収まらなければ上へ反転する。
+pub fn suggestion_hint_rect(panel: PanelScreenRect, vs: VirtualScreen) -> PanelScreenRect {
+    let vs_bottom = vs.y + vs.height;
+    let below_top = panel.bottom + SUGGESTION_HINT_BELOW_GAP_PX;
+    let below_bottom = below_top + SUGGESTION_HINT_HEIGHT_PX;
+    if below_bottom <= vs_bottom {
+        PanelScreenRect {
+            left: panel.left,
+            top: below_top,
+            right: panel.right,
+            bottom: below_bottom,
+        }
+    } else {
+        let top = (panel.top - SUGGESTION_HINT_ABOVE_GAP_PX - SUGGESTION_HINT_HEIGHT_PX).max(vs.y);
+        PanelScreenRect {
+            left: panel.left,
+            top,
+            right: panel.right,
+            bottom: top + SUGGESTION_HINT_HEIGHT_PX,
+        }
+    }
+}
+
 pub fn is_pointer_out_of_bounds(
     cursor: (i32, i32),
     panel: PanelScreenRect,
@@ -254,5 +282,47 @@ mod tests {
 
         assert!(is_pointer_out_of_bounds((39, 150), panel, margin));
         assert!(is_pointer_out_of_bounds((341, 150), panel, margin));
+    }
+
+    #[test]
+    fn suggestion_hint_sits_below_panel_when_it_fits() {
+        let vs = VirtualScreen {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let panel = PanelScreenRect {
+            left: 100,
+            top: 100,
+            right: 280,
+            bottom: 280,
+        };
+        let hint = suggestion_hint_rect(panel, vs);
+        assert_eq!(hint.left, 100);
+        assert_eq!(hint.right, 280);
+        assert_eq!(hint.top, 290);
+        assert_eq!(hint.bottom, 306);
+    }
+
+    #[test]
+    fn suggestion_hint_flips_above_when_below_clips() {
+        let vs = VirtualScreen {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let panel = PanelScreenRect {
+            left: 100,
+            top: 900,
+            right: 280,
+            bottom: 1080,
+        };
+        let hint = suggestion_hint_rect(panel, vs);
+        assert_eq!(hint.bottom, 880);
+        assert_eq!(hint.top, 864);
+        assert!(hint.bottom <= panel.top);
+        assert!(hint.top >= vs.y);
     }
 }

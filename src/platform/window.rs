@@ -4,15 +4,16 @@ use std::io;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
 use crate::platform::layout::{
-    minimap_anchor_layout, minimap_cell_at, point_within_radius, VirtualScreen,
+    is_pointer_out_of_bounds, minimap_anchor_layout, minimap_cell_at, point_within_radius,
+    suggestion_hint_rect, PanelScreenRect, VirtualScreen, DISMISS_OUT_OF_BOUNDS_MARGIN_PX,
     MINIMAP_CELL_PX, MINIMAP_GRID, MINIMAP_PANEL_PX, ORIGIN_CANCEL_RADIUS_PX,
-    DISMISS_OUT_OF_BOUNDS_MARGIN_PX, PanelScreenRect, is_pointer_out_of_bounds,
 };
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, DeleteDC, DeleteObject, SelectObject, BITMAPINFO, BITMAPINFOHEADER,
-    BI_RGB, DIB_RGB_COLORS,
+    CreateCompatibleDC, CreateFontW, DeleteDC, DeleteObject, DrawTextW, SelectObject, SetBkMode,
+    SetTextColor, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DEFAULT_CHARSET, DIB_RGB_COLORS,
+    DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, FW_NORMAL, HDC, TRANSPARENT,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -106,6 +107,7 @@ pub struct HudOverlay {
     pixel_len: usize,
     active: bool,
     hover_cell: Option<(usize, usize)>,
+    suggestion_hint: Option<String>,
 }
 
 // HWND / DIB はメッセージスレッドのみで使用する
@@ -162,6 +164,7 @@ impl HudOverlay {
             pixel_len: dib.len,
             active: false,
             hover_cell: None,
+            suggestion_hint: None,
         };
 
         overlay.present_transparent()?;
@@ -186,7 +189,10 @@ impl HudOverlay {
     }
 
     /// サークル発火時: アンカー一致でパネル展開（地縛霊 ≈ 物理カーソル）
-    pub unsafe fn activate_at_cursor(&mut self) -> io::Result<HudActivateDiag> {
+    pub unsafe fn activate_at_cursor(
+        &mut self,
+        suggestion_hint: Option<&str>,
+    ) -> io::Result<HudActivateDiag> {
         let mut origin = POINT::default();
         windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut origin)
             .map_err(|e| io::Error::other(format!("GetCursorPos: {e}")))?;
@@ -204,6 +210,7 @@ impl HudOverlay {
             bottom: layout.panel_top + MINIMAP_PANEL_PX,
         };
         self.hover_cell = None;
+        self.suggestion_hint = suggestion_hint.map(str::to_string);
 
         self.redraw()?;
         let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
@@ -251,6 +258,7 @@ impl HudOverlay {
         let _ = ReleaseCapture();
         self.active = false;
         self.hover_cell = None;
+        self.suggestion_hint = None;
         clear_pixels(self.pixels, self.pixel_len);
         self.present_transparent()?;
         let _ = ShowWindow(self.hwnd, SW_HIDE);
@@ -323,6 +331,17 @@ impl HudOverlay {
             self.panel_screen,
             self.hover_cell,
         );
+        if let Some(summary) = self.suggestion_hint.as_deref() {
+            unsafe {
+                draw_suggestion_hint(
+                    self.dib_dc,
+                    self.pixels,
+                    self.virtual_screen,
+                    self.panel_screen,
+                    summary,
+                );
+            }
+        }
         unsafe { self.present_transparent() }
     }
 
@@ -569,6 +588,117 @@ fn draw_hud(
         255,
         200,
     );
+}
+
+const HINT_TEXT_R: u8 = 64;
+const HINT_TEXT_G: u8 = 128;
+const HINT_TEXT_B: u8 = 144;
+const HINT_TEXT_A: u8 = 200;
+
+unsafe fn draw_suggestion_hint(
+    dc: HDC,
+    pixels: *mut u8,
+    vs: VirtualScreen,
+    panel_screen: RECT,
+    summary: &str,
+) {
+    let hint = suggestion_hint_rect(
+        PanelScreenRect {
+            left: panel_screen.left,
+            top: panel_screen.top,
+            right: panel_screen.right,
+            bottom: panel_screen.bottom,
+        },
+        vs,
+    );
+    let mut rect = RECT {
+        left: hint.left - vs.x,
+        top: hint.top - vs.y,
+        right: hint.right - vs.x,
+        bottom: hint.bottom - vs.y,
+    };
+    let repair = rect;
+
+    let font = CreateFontW(
+        12,
+        0,
+        0,
+        0,
+        FW_NORMAL.0 as i32,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET.0 as u32,
+        0,
+        0,
+        0,
+        0,
+        w!("Segoe UI"),
+    );
+    let old_font = SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(
+        dc,
+        COLORREF((HINT_TEXT_B as u32) << 16 | (HINT_TEXT_G as u32) << 8 | HINT_TEXT_R as u32),
+    );
+
+    let text = format!("[ 微調整案: {summary} (トレイで適用) ]");
+    let mut wide: Vec<u16> = text.encode_utf16().collect();
+    let _ = DrawTextW(
+        dc,
+        &mut wide,
+        &mut rect,
+        DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+    );
+
+    let _ = SelectObject(dc, old_font);
+    let _ = DeleteObject(font);
+    repair_gdi_text_alpha(
+        pixels,
+        vs.width,
+        vs.height,
+        repair.left,
+        repair.top,
+        repair.right,
+        repair.bottom,
+    );
+}
+
+fn repair_gdi_text_alpha(
+    pixels: *mut u8,
+    width: i32,
+    height: i32,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+) {
+    if pixels.is_null() {
+        return;
+    }
+    let left = left.max(0);
+    let top = top.max(0);
+    let right = right.min(width);
+    let bottom = bottom.min(height);
+    for y in top..bottom {
+        for x in left..right {
+            let idx = ((y * width + x) * 4) as isize;
+            unsafe {
+                let p = pixels.offset(idx);
+                let b = *p;
+                let g = *p.offset(1);
+                let r = *p.offset(2);
+                let a = *p.offset(3);
+                if a == 0 && (b | g | r) != 0 {
+                    let aa = HINT_TEXT_A as u16;
+                    *p = ((b as u16 * aa) / 255) as u8;
+                    *p.offset(1) = ((g as u16 * aa) / 255) as u8;
+                    *p.offset(2) = ((r as u16 * aa) / 255) as u8;
+                    *p.offset(3) = HINT_TEXT_A;
+                }
+            }
+        }
+    }
 }
 
 fn set_pixel_premul(

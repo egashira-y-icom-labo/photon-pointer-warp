@@ -17,7 +17,8 @@ use photon_pointer_warp::domain::config::AppConfig;
 use photon_pointer_warp::platform::calibrate_window::CALIBRATE_MUTEX_NAME;
 use photon_pointer_warp::platform::layout::warp_target_for_cell;
 use photon_pointer_warp::platform::tray::{
-    TrayEvent, TrayIcon, IDM_CALIBRATE, IDM_EXIT, IDM_PAUSE, WM_TRAYICON,
+    TrayEvent, TrayIcon, IDM_APPLY_SUGGESTION, IDM_CALIBRATE, IDM_DISMISS_SUGGESTION, IDM_EXIT,
+    IDM_PAUSE, WM_TRAYICON,
 };
 use photon_pointer_warp::platform::window::HudOverlay;
 use windows::core::w;
@@ -525,7 +526,7 @@ fn poll_config_and_calibrate_child() {
 fn handle_tray_callback(lparam: LPARAM) {
     match TrayIcon::callback_event(lparam) {
         Some(TrayEvent::ContextMenu) => {
-            let (paused, hwnd) = {
+            let (paused, hwnd, suggestion) = {
                 let guard = match APP.get().and_then(|a| a.try_lock().ok()) {
                     Some(g) => g,
                     None => return,
@@ -533,10 +534,17 @@ fn handle_tray_callback(lparam: LPARAM) {
                 let Some(tray) = guard.tray.as_ref() else {
                     return;
                 };
-                (guard.detection_paused, tray.hwnd())
+                (
+                    guard.detection_paused,
+                    tray.hwnd(),
+                    guard
+                        .pending_suggestion
+                        .as_ref()
+                        .map(|s| s.summary.clone()),
+                )
             };
 
-            let cmd_id = unsafe { TrayIcon::track_menu(hwnd, paused) };
+            let cmd_id = unsafe { TrayIcon::track_menu(hwnd, paused, suggestion.as_deref()) };
             if cmd_id != 0 {
                 handle_tray_command_sync(hwnd, cmd_id);
             }
@@ -567,6 +575,16 @@ fn handle_tray_command_sync(hwnd: HWND, id: u32) {
                 if let Some(tray) = guard.tray.as_mut() {
                     unsafe { tray.set_paused(paused) };
                 }
+            }
+        }
+        IDM_APPLY_SUGGESTION => {
+            if let Some(mut guard) = APP.get().and_then(|a| a.try_lock().ok()) {
+                apply_pending_suggestion(&mut guard);
+            }
+        }
+        IDM_DISMISS_SUGGESTION => {
+            if let Some(mut guard) = APP.get().and_then(|a| a.try_lock().ok()) {
+                clear_suggestion_state(&mut guard);
             }
         }
         IDM_EXIT => unsafe {
@@ -641,10 +659,14 @@ fn settling_ready(pending: &PendingSettling, now: Instant) -> bool {
 
 fn open_hud_after_settle(guard: &mut AppState, stats: GestureWindowStats) -> io::Result<()> {
     let message_hwnd = HWND(MESSAGE_HWND.load(Ordering::Acquire) as _);
+    let hint = guard
+        .pending_suggestion
+        .as_ref()
+        .map(|s| s.summary.clone());
     let hud_diag = unsafe {
         guard
             .hud
-            .activate_at_cursor()
+            .activate_at_cursor(hint.as_deref())
             .map_err(|e| io::Error::other(format!("HUD activate: {e}")))?
     };
     let dpi = unsafe { GetDpiForSystem() };
@@ -898,10 +920,43 @@ fn push_feedback_event(state: &mut AppState, event: FeedbackEvent) {
 fn refresh_pending_suggestion(state: &mut AppState) {
     let events: Vec<FeedbackEvent> = state.feedback_events.iter().cloned().collect();
     state.pending_suggestion = generate_suggestion(state.detector.config(), &events);
+    sync_tray_suggestion(state);
     if let Some(suggestion) = &state.pending_suggestion {
         eprintln!("[adapt] suggestion: {}", suggestion.summary);
         let _ = io::stderr().flush();
     }
+}
+
+fn sync_tray_suggestion(state: &mut AppState) {
+    let pending = state.pending_suggestion.is_some();
+    if let Some(tray) = state.tray.as_mut() {
+        unsafe {
+            tray.set_suggest_pending(pending);
+        }
+    }
+}
+
+fn clear_suggestion_state(state: &mut AppState) {
+    state.feedback_events.clear();
+    state.pending_suggestion = None;
+    sync_tray_suggestion(state);
+}
+
+fn apply_pending_suggestion(state: &mut AppState) {
+    let Some(suggestion) = state.pending_suggestion.take() else {
+        return;
+    };
+    let mut cfg = AppConfig::load_or_default();
+    cfg.detector = suggestion.new_config.clone();
+    if let Err(e) = cfg.save() {
+        eprintln!("failed to save suggestion: {e}");
+        state.pending_suggestion = Some(suggestion);
+        return;
+    }
+    state.detector.replace_config(suggestion.new_config);
+    state.pending_settling = None;
+    state.config_mtime = config_file_mtime();
+    clear_suggestion_state(state);
 }
 
 fn stroke_metrics_ending_at(state: &AppState, end_ms: u64) -> Option<StrokeMetrics> {
@@ -998,7 +1053,11 @@ fn warp_hud_to_cell(col: usize, row: usize) {
     }
     println!("[warp] Jumped to ({target_x}, {target_y}) [cell: {col}, {row}]");
     let _ = io::stdout().flush();
-    if let Err(e) = unsafe { guard.hud.activate_at_cursor() } {
+    let hint = guard
+        .pending_suggestion
+        .as_ref()
+        .map(|s| s.summary.clone());
+    if let Err(e) = unsafe { guard.hud.activate_at_cursor(hint.as_deref()) } {
         eprintln!("[hud] Failed to re-activate at landing point: {e}");
         return;
     }

@@ -3,7 +3,7 @@
 use std::io;
 use std::mem::size_of;
 
-use windows::core::w;
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
@@ -23,15 +23,18 @@ pub const TRAY_UID: u32 = 1;
 pub const IDM_CALIBRATE: usize = 4001;
 pub const IDM_PAUSE: usize = 4002;
 pub const IDM_EXIT: usize = 4003;
+pub const IDM_APPLY_SUGGESTION: usize = 4004;
+pub const IDM_DISMISS_SUGGESTION: usize = 4005;
 
 const TIP_ACTIVE: &str = "Photon Pointer Warp";
 const TIP_PAUSED: &str = "Photon Pointer Warp (一時停止中)";
-const TIP_SUGGEST: &str = "Photon Pointer Warp (感度調整の提案あり)";
+const TIP_SUGGEST: &str = "Photon Pointer Warp (感度微調整の提案あり)";
 
 pub struct TrayIcon {
     hwnd: HWND,
     icon_active: HICON,
     icon_paused: HICON,
+    icon_suggest: HICON,
     paused: bool,
     suggest_pending: bool,
 }
@@ -41,12 +44,14 @@ unsafe impl Send for TrayIcon {}
 
 impl TrayIcon {
     pub unsafe fn add(hwnd: HWND, instance: HINSTANCE) -> io::Result<Self> {
-        let icon_active = create_circle_icon(instance, 50, 140, 230)?;
-        let icon_paused = create_circle_icon(instance, 120, 120, 120)?;
+        let icon_active = create_circle_icon(instance, 50, 140, 230, false)?;
+        let icon_paused = create_circle_icon(instance, 120, 120, 120, false)?;
+        let icon_suggest = create_circle_icon(instance, 50, 140, 230, true)?;
         let tray = Self {
             hwnd,
             icon_active,
             icon_paused,
+            icon_suggest,
             paused: false,
             suggest_pending: false,
         };
@@ -96,7 +101,7 @@ impl TrayIcon {
     }
 
     /// モーダルメニューを出し、選択 ID を返す（キャンセルは 0）。`WM_COMMAND` は送らない。
-    pub unsafe fn track_menu(hwnd: HWND, paused: bool) -> u32 {
+    pub unsafe fn track_menu(hwnd: HWND, paused: bool, suggestion: Option<&str>) -> u32 {
         let mut pt = POINT::default();
         if GetCursorPos(&mut pt).is_err() {
             return 0;
@@ -104,6 +109,24 @@ impl TrayIcon {
         let Ok(menu) = CreatePopupMenu() else {
             return 0;
         };
+        let apply_label;
+        if let Some(summary) = suggestion {
+            apply_label = utf16_z(&format!("★ 感度の微調整を適用: {summary}"));
+            let dismiss_label = utf16_z("提案を見送る");
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                IDM_APPLY_SUGGESTION,
+                PCWSTR(apply_label.as_ptr()),
+            );
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                IDM_DISMISS_SUGGESTION,
+                PCWSTR(dismiss_label.as_ptr()),
+            );
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, w!(""));
+        }
         let _ = AppendMenuW(menu, MF_STRING, IDM_CALIBRATE, w!("設定 / キャリブレーション..."));
         let pause_flags = if paused {
             MF_STRING | MF_CHECKED
@@ -143,6 +166,8 @@ impl TrayIcon {
         nid.uCallbackMessage = WM_TRAYICON;
         nid.hIcon = if self.paused {
             self.icon_paused
+        } else if self.suggest_pending {
+            self.icon_suggest
         } else {
             self.icon_active
         };
@@ -166,6 +191,7 @@ impl Drop for TrayIcon {
             self.remove();
             let _ = DestroyIcon(self.icon_active);
             let _ = DestroyIcon(self.icon_paused);
+            let _ = DestroyIcon(self.icon_suggest);
         }
     }
 }
@@ -182,7 +208,26 @@ fn copy_tip(dst: &mut [u16; 128], text: &str) {
     dst[..encoded.len()].copy_from_slice(&encoded);
 }
 
-unsafe fn create_circle_icon(instance: HINSTANCE, r: u8, g: u8, b: u8) -> io::Result<HICON> {
+fn utf16_z(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn paint_pixel(xor: &mut [u8], and_mask: &mut [u8], x: usize, y: usize, r: u8, g: u8, b: u8) {
+    let i = (y * 16 + x) * 4;
+    xor[i] = b;
+    xor[i + 1] = g;
+    xor[i + 2] = r;
+    xor[i + 3] = 255;
+    and_mask[y * 2 + x / 8] &= !(1u8 << (7 - (x % 8)));
+}
+
+unsafe fn create_circle_icon(
+    instance: HINSTANCE,
+    r: u8,
+    g: u8,
+    b: u8,
+    suggest_dot: bool,
+) -> io::Result<HICON> {
     let mut xor = vec![0u8; 16 * 16 * 4];
     let mut and_mask = vec![0xFFu8; 16 * 2];
     for y in 0..16 {
@@ -190,12 +235,14 @@ unsafe fn create_circle_icon(instance: HINSTANCE, r: u8, g: u8, b: u8) -> io::Re
             let dx = x as i32 - 8;
             let dy = y as i32 - 8;
             if dx * dx + dy * dy <= 36 {
-                let i = (y * 16 + x) * 4;
-                xor[i] = b;
-                xor[i + 1] = g;
-                xor[i + 2] = r;
-                xor[i + 3] = 255;
-                and_mask[y * 2 + x / 8] &= !(1u8 << (7 - (x % 8)));
+                paint_pixel(&mut xor, &mut and_mask, x, y, r, g, b);
+            }
+        }
+    }
+    if suggest_dot {
+        for y in 1..4 {
+            for x in 12..15 {
+                paint_pixel(&mut xor, &mut and_mask, x, y, 0, 220, 230);
             }
         }
     }
