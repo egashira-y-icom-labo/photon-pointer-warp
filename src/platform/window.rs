@@ -4,8 +4,8 @@ use std::io;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
 use crate::platform::layout::{
-    minimap_cell_at, minimap_panel_origin, minimap_pin_screen_from_gesture, point_within_radius,
-    VirtualScreen, MINIMAP_CELL_PX, MINIMAP_GRID, MINIMAP_PANEL_PX, ORIGIN_CANCEL_RADIUS_PX,
+    minimap_anchor_layout, minimap_cell_at, point_within_radius, VirtualScreen,
+    MINIMAP_CELL_PX, MINIMAP_GRID, MINIMAP_PANEL_PX, ORIGIN_CANCEL_RADIUS_PX,
 };
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -15,10 +15,11 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, GetSystemMetrics, RegisterClassW, SetWindowPos, ShowWindow, UpdateLayeredWindow,
-    CS_HREDRAW, CS_VREDRAW, HWND_TOPMOST, SM_CYVIRTUALSCREEN, SM_CXVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, GetSystemMetrics, LoadCursorW, RegisterClassW, SetCursor, SetWindowPos,
+    ShowWindow, UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, HCURSOR, IDC_ARROW, HWND_TOPMOST,
+    SM_CYVIRTUALSCREEN, SM_CXVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE,
+    SW_SHOWNOACTIVATE, ULW_ALPHA, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 
 const HUD_CLASS: windows::core::PCWSTR = w!("PhotonPointerWarpHud");
@@ -28,6 +29,22 @@ const PIN_INNER_RADIUS: i32 = 4;
 const PIN_MID_RADIUS: i32 = 7;
 
 static HUD_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// 標準矢印カーソルを読み込む（`RegisterClassW` の `hCursor` 等）。
+pub unsafe fn load_arrow_cursor() -> HCURSOR {
+    LoadCursorW(None, IDC_ARROW).unwrap_or_default()
+}
+
+/// HUD 上で砂時計にならないよう、明示的に矢印カーソルを設定する。
+pub unsafe fn set_arrow_cursor() {
+    let _ = SetCursor(load_arrow_cursor());
+}
+
+/// `WM_SETCURSOR` 用: 矢印を設定し、DefWindowProc へ渡さない。
+pub unsafe fn handle_wm_setcursor() -> LRESULT {
+    set_arrow_cursor();
+    LRESULT(1)
+}
 
 pub fn note_hud_destroyed() {
     HUD_HWND.store(0, Ordering::Release);
@@ -100,12 +117,14 @@ impl HudOverlay {
         wnd_proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
     ) -> io::Result<Self> {
         let vs = query_virtual_screen();
+        let arrow = load_arrow_cursor();
 
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wnd_proc),
             hInstance: instance,
             lpszClassName: HUD_CLASS,
             style: CS_HREDRAW | CS_VREDRAW,
+            hCursor: arrow,
             ..Default::default()
         };
         RegisterClassW(&wc);
@@ -165,33 +184,23 @@ impl HudOverlay {
         self.hover_cell
     }
 
-    /// サークル発火時: ジェスチャ起点でパネルを展開し、地縛霊はミニマップ上へ射影
+    /// サークル発火時: アンカー一致でパネル展開（地縛霊 ≈ 物理カーソル）
     pub unsafe fn activate_at_cursor(&mut self) -> io::Result<HudActivateDiag> {
         let mut origin = POINT::default();
         windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut origin)
             .map_err(|e| io::Error::other(format!("GetCursorPos: {e}")))?;
 
-        let (left, top) = minimap_panel_origin(
-            origin.x,
-            origin.y,
-            MINIMAP_PANEL_PX,
-            self.virtual_screen,
-        );
         self.gesture_origin_screen = origin;
-        let (pin_x, pin_y) = minimap_pin_screen_from_gesture(
-            origin.x,
-            origin.y,
-            left,
-            top,
-            MINIMAP_PANEL_PX,
-            self.virtual_screen,
-        );
-        self.pin_screen = POINT { x: pin_x, y: pin_y };
+        let layout = minimap_anchor_layout(origin.x, origin.y, self.virtual_screen);
+        self.pin_screen = POINT {
+            x: layout.pin_screen_x,
+            y: layout.pin_screen_y,
+        };
         self.panel_screen = RECT {
-            left,
-            top,
-            right: left + MINIMAP_PANEL_PX,
-            bottom: top + MINIMAP_PANEL_PX,
+            left: layout.panel_left,
+            top: layout.panel_top,
+            right: layout.panel_left + MINIMAP_PANEL_PX,
+            bottom: layout.panel_top + MINIMAP_PANEL_PX,
         };
         self.hover_cell = None;
 
@@ -207,6 +216,7 @@ impl HudOverlay {
             windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
         );
         let _ = SetCapture(self.hwnd);
+        set_arrow_cursor();
         self.active = true;
         Ok(self.activation_diagnostic())
     }

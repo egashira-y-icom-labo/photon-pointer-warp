@@ -571,10 +571,11 @@ unsafe extern "system" fn hud_wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     use windows::Win32::UI::WindowsAndMessaging::{
-        WM_DESTROY, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
+        WM_DESTROY, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR,
     };
 
     match msg {
+        WM_SETCURSOR => photon_pointer_warp::platform::window::handle_wm_setcursor(),
         WM_MOUSEMOVE => {
             let mut point = POINT::default();
             if GetCursorPos(&mut point).is_ok() {

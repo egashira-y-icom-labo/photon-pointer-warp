@@ -1,24 +1,5 @@
 //! HUD レイアウト（Win32 非依存）
 
-/// 原点を中心に `panel` 四方の矩形を置き、仮想デスクトップ `(vx, vy, vw, vh)` 内に収める。
-pub fn minimap_panel_origin(origin_x: i32, origin_y: i32, panel: i32, virtual_screen: VirtualScreen) -> (i32, i32) {
-    let VirtualScreen { x: vx, y: vy, width: vw, height: vh } = virtual_screen;
-    let half = panel / 2;
-    let mut left = origin_x - half;
-    let mut top = origin_y - half;
-    if vw > panel {
-        left = left.clamp(vx, vx + vw - panel);
-    } else {
-        left = vx;
-    }
-    if vh > panel {
-        top = top.clamp(vy, vy + vh - panel);
-    } else {
-        top = vy;
-    }
-    (left, top)
-}
-
 pub const MINIMAP_GRID: usize = 3;
 /// 3×3 ミニマップパネル一辺（px）
 pub const MINIMAP_PANEL_PX: i32 = 180;
@@ -26,6 +7,66 @@ pub const MINIMAP_PANEL_PX: i32 = 180;
 pub const MINIMAP_CELL_PX: i32 = MINIMAP_PANEL_PX / MINIMAP_GRID as i32;
 /// 地縛霊クリックキャンセル半径（px）
 pub const ORIGIN_CANCEL_RADIUS_PX: i32 = 15;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtualScreen {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// ミニマップのアンカー一致レイアウト（地縛霊ピン ≈ 物理カーソル）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MinimapAnchorLayout {
+    pub panel_left: i32,
+    pub panel_top: i32,
+    pub pin_screen_x: i32,
+    pub pin_screen_y: i32,
+}
+
+fn gesture_pin_offsets(gesture_x: i32, gesture_y: i32, panel_size: i32, vs: VirtualScreen) -> (i32, i32) {
+    let norm_x =
+        ((gesture_x - vs.x) as f32 / vs.width.max(1) as f32).clamp(0.0, 1.0);
+    let norm_y =
+        ((gesture_y - vs.y) as f32 / vs.height.max(1) as f32).clamp(0.0, 1.0);
+    let pin_offset_x = (norm_x * panel_size as f32).round() as i32;
+    let pin_offset_y = (norm_y * panel_size as f32).round() as i32;
+    (pin_offset_x, pin_offset_y)
+}
+
+/// 地縛霊ピンが `gesture` と重なるようパネルを配置（はみ出し時のみクランプ）。
+pub fn minimap_anchor_layout(
+    gesture_x: i32,
+    gesture_y: i32,
+    vs: VirtualScreen,
+) -> MinimapAnchorLayout {
+    let panel_size = MINIMAP_PANEL_PX;
+    let (pin_offset_x, pin_offset_y) = gesture_pin_offsets(gesture_x, gesture_y, panel_size, vs);
+
+    let ideal_left = gesture_x - pin_offset_x;
+    let ideal_top = gesture_y - pin_offset_y;
+
+    let max_left = if vs.width > panel_size {
+        vs.x + vs.width - panel_size
+    } else {
+        vs.x
+    };
+    let max_top = if vs.height > panel_size {
+        vs.y + vs.height - panel_size
+    } else {
+        vs.y
+    };
+    let panel_left = ideal_left.clamp(vs.x, max_left);
+    let panel_top = ideal_top.clamp(vs.y, max_top);
+
+    MinimapAnchorLayout {
+        panel_left,
+        panel_top,
+        pin_screen_x: panel_left + pin_offset_x,
+        pin_screen_y: panel_top + pin_offset_y,
+    }
+}
 
 /// 仮想デスクトップ 3×3 グリッドのセル中心座標（スクリーン座標）。
 pub fn warp_target_for_cell(col: usize, row: usize, virtual_screen: VirtualScreen) -> (i32, i32) {
@@ -76,70 +117,74 @@ pub fn point_within_radius(
     dx * dx + dy * dy <= radius_px * radius_px
 }
 
-/// 仮想デスクトップ上のジェスチャ起点を、ミニマップパネル内のスクリーン座標へ射影する。
-pub fn minimap_pin_screen_from_gesture(
-    gesture_x: i32,
-    gesture_y: i32,
-    panel_left: i32,
-    panel_top: i32,
-    panel_size: i32,
-    vs: VirtualScreen,
-) -> (i32, i32) {
-    let norm_x =
-        ((gesture_x - vs.x) as f32 / vs.width.max(1) as f32).clamp(0.0, 1.0);
-    let norm_y =
-        ((gesture_y - vs.y) as f32 / vs.height.max(1) as f32).clamp(0.0, 1.0);
-    let pin_x = panel_left + (norm_x * panel_size as f32).round() as i32;
-    let pin_y = panel_top + (norm_y * panel_size as f32).round() as i32;
-    (pin_x, pin_y)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VirtualScreen {
-    pub x: i32,
-    pub y: i32,
-    pub width: i32,
-    pub height: i32,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn panel_centered_when_room() {
-        let panel = MINIMAP_PANEL_PX;
-        let (l, t) = minimap_panel_origin(
-            500,
-            400,
-            panel,
-            VirtualScreen {
-                x: 0,
-                y: 0,
-                width: 1920,
-                height: 1080,
-            },
-        );
-        assert_eq!(l, 500 - panel / 2);
-        assert_eq!(t, 400 - panel / 2);
+    fn vs_1920x1200() -> VirtualScreen {
+        VirtualScreen {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1200,
+        }
+    }
+
+    fn assert_panel_inside_vs(layout: MinimapAnchorLayout, vs: VirtualScreen) {
+        assert!(layout.panel_left >= vs.x);
+        assert!(layout.panel_top >= vs.y);
+        assert!(layout.panel_left + MINIMAP_PANEL_PX <= vs.x + vs.width);
+        assert!(layout.panel_top + MINIMAP_PANEL_PX <= vs.y + vs.height);
     }
 
     #[test]
-    fn panel_clamped_at_right_edge() {
-        let panel = MINIMAP_PANEL_PX;
-        let (l, t) = minimap_panel_origin(
-            1900,
-            400,
-            panel,
-            VirtualScreen {
-                x: 0,
-                y: 0,
-                width: 1920,
-                height: 1080,
-            },
-        );
-        assert_eq!(l, 1920 - panel);
-        assert_eq!(t, 400 - panel / 2);
+    fn anchor_pin_matches_gesture_at_desktop_center() {
+        let vs = vs_1920x1200();
+        let layout = minimap_anchor_layout(960, 600, vs);
+        assert_eq!(layout.pin_screen_x, 960);
+        assert_eq!(layout.pin_screen_y, 600);
+        assert_panel_inside_vs(layout, vs);
+    }
+
+    #[test]
+    fn anchor_pin_matches_gesture_at_desktop_bottom_left() {
+        let vs = vs_1920x1200();
+        let layout = minimap_anchor_layout(96, 1140, vs);
+        assert_eq!(layout.pin_screen_x, 96);
+        assert_eq!(layout.pin_screen_y, 1140);
+        assert_panel_inside_vs(layout, vs);
+        let cell = minimap_cell_at(
+            layout.pin_screen_x,
+            layout.pin_screen_y,
+            layout.panel_left,
+            layout.panel_top,
+            MINIMAP_PANEL_PX,
+        )
+        .unwrap();
+        assert_eq!(cell, (0, 2));
+    }
+
+    #[test]
+    fn anchor_pin_matches_gesture_at_desktop_bottom_right() {
+        let vs = vs_1920x1200();
+        let layout = minimap_anchor_layout(1824, 1140, vs);
+        assert_eq!(layout.pin_screen_x, 1824);
+        assert_eq!(layout.pin_screen_y, 1140);
+        assert_panel_inside_vs(layout, vs);
+    }
+
+    #[test]
+    fn anchor_pin_matches_gesture_at_screen_corners() {
+        let vs = vs_1920x1200();
+        for (gx, gy) in [(0, 0), (1920, 0), (0, 1200), (1920, 1200)] {
+            let layout = minimap_anchor_layout(gx, gy, vs);
+            assert_eq!(
+                (layout.pin_screen_x, layout.pin_screen_y),
+                (gx, gy),
+                "gesture=({gx},{gy})"
+            );
+            assert_panel_inside_vs(layout, vs);
+        }
     }
 
     #[test]
@@ -167,47 +212,5 @@ mod tests {
     fn origin_cancel_radius_constant() {
         assert_eq!(ORIGIN_CANCEL_RADIUS_PX, 15);
         assert_eq!(MINIMAP_CELL_PX, 60);
-    }
-
-    #[test]
-    fn proportional_pin_at_desktop_bottom_left() {
-        let vs = VirtualScreen {
-            x: 0,
-            y: 0,
-            width: 1920,
-            height: 1200,
-        };
-        let panel = MINIMAP_PANEL_PX;
-        let (panel_left, panel_top) = minimap_panel_origin(96, 1140, panel, vs);
-        let (pin_x, pin_y) = minimap_pin_screen_from_gesture(
-            96,
-            1140,
-            panel_left,
-            panel_top,
-            panel,
-            vs,
-        );
-        let rel_x = pin_x - panel_left;
-        let rel_y = pin_y - panel_top;
-        assert!(rel_x < panel / 3, "pin should sit in left third, got rel_x={rel_x}");
-        assert!(rel_y >= panel * 2 / 3, "pin should sit in bottom third, got rel_y={rel_y}");
-        let cell = minimap_cell_at(pin_x, pin_y, panel_left, panel_top, panel).unwrap();
-        assert_eq!(cell, (0, 2));
-    }
-
-    #[test]
-    fn proportional_pin_at_desktop_center() {
-        let vs = VirtualScreen {
-            x: 0,
-            y: 0,
-            width: 1000,
-            height: 1000,
-        };
-        let panel = MINIMAP_PANEL_PX;
-        let (panel_left, panel_top) = (200, 200);
-        let (pin_x, pin_y) =
-            minimap_pin_screen_from_gesture(500, 500, panel_left, panel_top, panel, vs);
-        assert_eq!(pin_x - panel_left, 90);
-        assert_eq!(pin_y - panel_top, 90);
     }
 }
