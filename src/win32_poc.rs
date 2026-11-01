@@ -13,6 +13,9 @@ use photon_pointer_warp::domain::adaptation::{
 };
 use photon_pointer_warp::domain::calibration::{analyze_relative_stroke, StrokeMetrics};
 use photon_pointer_warp::domain::circle::{CircleDetector, GestureWindowStats, MotionSample};
+use photon_pointer_warp::domain::settle::{decide_settle, policy_for, SettleDecision};
+use photon_pointer_warp::domain::shake::ShakeDetector;
+use photon_pointer_warp::domain::trigger::{TriggerCoordinator, TriggerSource};
 use photon_pointer_warp::domain::config::AppConfig;
 use photon_pointer_warp::platform::calibrate_window::CALIBRATE_MUTEX_NAME;
 use photon_pointer_warp::platform::layout::warp_target_for_cell;
@@ -88,9 +91,6 @@ const IDLE_FLUSH_MS: u64 = 150;
 const STROKE_GAP_MS: u64 = 100;
 const DEBUG_ARC_MIN_DEG: f32 = 180.0;
 
-/// サークル成立後、慣性が落ち着くまで HUD 展開を遅延する。
-const SETTLING_WINDOW_MS: u64 = 50;
-const SETTLING_MAX_WAIT_MS: u64 = 100;
 /// 1 サンプルあたりの移動量（|Δ|）がこれを超えたら「大きな移動」とみなす。
 const SETTLING_SPEED_THRESHOLD: f32 = 3.0;
 /// 連続ワープ着地後、無操作なら HUD を消すまでの時間。
@@ -99,7 +99,8 @@ const CHAINED_WARP_TIMEOUT_MS: u64 = 2000;
 struct PendingSettling {
     started_at: Instant,
     last_significant_motion_at: Instant,
-    detection_stats: GestureWindowStats,
+    source: TriggerSource,
+    is_learning_target: bool,
 }
 
 const CLASS_NAME: windows::core::PCWSTR = w!("PhotonPointerWarpRawInput");
@@ -112,7 +113,7 @@ const RI_MOUSE_MIDDLE_BUTTON_DOWN: u16 = 0x0010;
 const RI_MOUSE_MIDDLE_BUTTON_UP: u16 = 0x0020;
 
 struct AppState {
-    detector: CircleDetector,
+    coordinator: TriggerCoordinator,
     last_input_at: Option<Instant>,
     buttons_down: u32,
     pending_arc_debug: Option<(GestureWindowStats, String)>,
@@ -232,7 +233,9 @@ pub fn run(config: AppConfig) -> io::Result<()> {
                 println!("Dedicated console opened. Exit: tray menu or Ctrl+C");
             }
         }
-        println!("Tray: calibrate / pause / quit. Draw a circle to open the HUD.");
+        println!(
+            "Tray: calibrate / pause / quit. Draw a circle or shake the pointer to open the HUD."
+        );
         let _ = io::stdout().flush();
     }
 
@@ -287,7 +290,10 @@ pub fn run(config: AppConfig) -> io::Result<()> {
 
         APP.get_or_init(|| {
             Mutex::new(AppState {
-                detector: CircleDetector::new(config.detector.clone()),
+                coordinator: TriggerCoordinator::new(
+                    CircleDetector::new(config.detector.clone()),
+                    ShakeDetector::new(),
+                ),
                 last_input_at: None,
                 buttons_down: 0,
                 pending_arc_debug: None,
@@ -437,7 +443,7 @@ fn config_file_mtime() -> Option<SystemTime> {
 
 fn reload_detector_from_disk(state: &mut AppState) {
     let cfg = AppConfig::load_or_default();
-    state.detector.replace_config(cfg.detector);
+    state.coordinator.circle.replace_config(cfg.detector);
     state.pending_settling = None;
     state.config_mtime = config_file_mtime();
 }
@@ -648,23 +654,40 @@ fn settling_note_motion(pending: &mut PendingSettling, dx: f32, dy: f32, now: In
     }
 }
 
-fn settling_ready(pending: &PendingSettling, now: Instant) -> bool {
+fn settle_decision(pending: &PendingSettling, now: Instant) -> SettleDecision {
     let elapsed_ms = now
         .saturating_duration_since(pending.started_at)
         .as_millis() as u64;
     let quiet_ms = now
         .saturating_duration_since(pending.last_significant_motion_at)
         .as_millis() as u64;
-    if elapsed_ms >= SETTLING_MAX_WAIT_MS {
-        return true;
-    }
-    if quiet_ms >= SETTLING_WINDOW_MS {
-        return true;
-    }
-    false
+    decide_settle(elapsed_ms, quiet_ms, policy_for(pending.source))
 }
 
-fn open_hud_after_settle(guard: &mut AppState, stats: GestureWindowStats) -> io::Result<()> {
+fn apply_settle_decision(guard: &mut AppState, decision: SettleDecision) -> io::Result<()> {
+    match decision {
+        SettleDecision::Wait => Ok(()),
+        SettleDecision::Open => {
+            let pending = guard.pending_settling.take().expect("pending_settling");
+            open_hud_after_settle(guard, pending.source, pending.is_learning_target)
+        }
+        SettleDecision::Cancel => {
+            let pending = guard.pending_settling.take().expect("pending_settling");
+            println!(
+                "[detect] {:?} settle cancelled (still moving)",
+                pending.source
+            );
+            let _ = io::stdout().flush();
+            Ok(())
+        }
+    }
+}
+
+fn open_hud_after_settle(
+    guard: &mut AppState,
+    source: TriggerSource,
+    is_learning_target: bool,
+) -> io::Result<()> {
     let message_hwnd = HWND(MESSAGE_HWND.load(Ordering::Acquire) as _);
     let hint = guard
         .pending_suggestion
@@ -680,38 +703,34 @@ fn open_hud_after_settle(guard: &mut AppState, stats: GestureWindowStats) -> io:
     println!("{}", hud_diag.format_line(dpi));
     let _ = io::stdout().flush();
     unsafe { register_esc_hotkey_if_needed(message_hwnd, guard)? };
-    println!(
-        "[detect] Circle gesture - {:.0}deg in {}ms (HUD open; click cell to warp)",
-        stats.net_angle_deg, stats.elapsed_ms
-    );
+    println!("[detect] {:?} (HUD open; click cell to warp)", source);
     let _ = io::stdout().flush();
-    note_circle_hud_opened(guard);
+    if is_learning_target {
+        note_circle_hud_opened(guard);
+    } else {
+        guard.feedback_circle_hud = false;
+    }
     Ok(())
 }
 
 fn try_finish_settling(guard: &mut AppState) -> io::Result<()> {
     let now = Instant::now();
-    let should_open = guard
+    let Some(decision) = guard
         .pending_settling
         .as_ref()
-        .is_some_and(|p| settling_ready(p, now));
-    if !should_open {
+        .map(|pending| settle_decision(pending, now))
+    else {
         return Ok(());
-    }
-    let stats = guard
-        .pending_settling
-        .take()
-        .expect("pending_settling")
-        .detection_stats;
-    open_hud_after_settle(guard, stats)
+    };
+    apply_settle_decision(guard, decision)
 }
 
 fn update_pending_arc_debug(state: &mut AppState) {
-    let stats = state.detector.window_stats();
+    let stats = state.coordinator.circle.window_stats();
     if stats.net_angle_deg <= DEBUG_ARC_MIN_DEG {
         return;
     }
-    let Some(reason) = state.detector.circle_reject_reason() else {
+    let Some(reason) = state.coordinator.circle.circle_reject_reason() else {
         return;
     };
     state.pending_arc_debug = Some((stats, reason.to_string()));
@@ -778,6 +797,10 @@ unsafe fn handle_wm_input(lparam: LPARAM) -> io::Result<()> {
 
     apply_button_flags(&mut guard, &mouse);
 
+    if guard.detection_paused || guard.calibrating || guard.buttons_down > 0 {
+        guard.coordinator.reset();
+    }
+
     if guard.detection_paused || guard.calibrating {
         return Ok(());
     }
@@ -794,7 +817,6 @@ unsafe fn handle_wm_input(lparam: LPARAM) -> io::Result<()> {
         guard.last_input_at = Some(now);
         if dt >= STROKE_GAP_MS {
             flush_pending_debug(&mut guard);
-            guard.pending_settling = None;
         }
         dt
     } else {
@@ -805,12 +827,13 @@ unsafe fn handle_wm_input(lparam: LPARAM) -> io::Result<()> {
         push_motion_history(&mut guard, dx, dy, dt_millis);
     }
 
-    if let Some(ref mut pending) = guard.pending_settling {
-        settling_note_motion(pending, dx, dy, now);
-        if settling_ready(pending, now) {
-            let stats = guard.pending_settling.take().unwrap().detection_stats;
-            open_hud_after_settle(&mut guard, stats)?;
-        }
+    if guard.pending_settling.is_some() {
+        let decision = {
+            let pending = guard.pending_settling.as_mut().expect("pending_settling");
+            settling_note_motion(pending, dx, dy, now);
+            settle_decision(pending, now)
+        };
+        apply_settle_decision(&mut guard, decision)?;
         return Ok(());
     }
 
@@ -823,19 +846,20 @@ unsafe fn handle_wm_input(lparam: LPARAM) -> io::Result<()> {
         dy,
         dt_millis: dt_millis.max(1),
     };
+    let button_down = guard.buttons_down > 0;
+    let paused = guard.detection_paused;
+    let calibrating = guard.calibrating;
 
-    let fired = guard.detector.push(sample);
-    if fired {
+    if let Some(result) = guard.coordinator.push(sample, button_down, paused, calibrating) {
         guard.pending_arc_debug = None;
-        guard.last_fire_clock_ms = Some(guard.input_clock_ms);
-        let stats = guard
-            .detector
-            .last_detection_stats()
-            .unwrap_or_else(|| guard.detector.window_stats());
+        if result.is_learning_target {
+            guard.last_fire_clock_ms = Some(guard.input_clock_ms);
+        }
         guard.pending_settling = Some(PendingSettling {
             started_at: now,
             last_significant_motion_at: now,
-            detection_stats: stats,
+            source: result.source,
+            is_learning_target: result.is_learning_target,
         });
     } else {
         update_pending_arc_debug(&mut guard);
@@ -867,7 +891,8 @@ fn apply_button_flags(state: &mut AppState, mouse: &RAWMOUSE) {
     }
 
     state
-        .detector
+        .coordinator
+        .circle
         .set_drag_state(state.buttons_down > 0);
 }
 
@@ -926,7 +951,7 @@ fn push_feedback_event(state: &mut AppState, event: FeedbackEvent) {
 
 fn refresh_pending_suggestion(state: &mut AppState) {
     let events: Vec<FeedbackEvent> = state.feedback_events.iter().cloned().collect();
-    state.pending_suggestion = generate_suggestion(state.detector.config(), &events);
+    state.pending_suggestion = generate_suggestion(state.coordinator.circle.config(), &events);
     sync_tray_suggestion(state);
     if let Some(suggestion) = &state.pending_suggestion {
         eprintln!("[adapt] suggestion: {}", suggestion.summary);
@@ -960,14 +985,17 @@ fn apply_pending_suggestion(state: &mut AppState) {
         state.pending_suggestion = Some(suggestion);
         return;
     }
-    state.detector.replace_config(suggestion.new_config);
+    state
+        .coordinator
+        .circle
+        .replace_config(suggestion.new_config);
     state.pending_settling = None;
     state.config_mtime = config_file_mtime();
     clear_suggestion_state(state);
 }
 
 fn stroke_metrics_ending_at(state: &AppState, end_ms: u64) -> Option<StrokeMetrics> {
-    let window = state.detector.config().window_ms;
+    let window = state.coordinator.circle.config().window_ms;
     let start = end_ms.saturating_sub(window);
     let samples: Vec<(f32, f32, u64)> = state
         .raw_motion_history
@@ -981,7 +1009,8 @@ fn stroke_metrics_ending_at(state: &AppState, end_ms: u64) -> Option<StrokeMetri
 fn note_circle_hud_opened(state: &mut AppState) {
     let success_t = state.last_fire_clock_ms.unwrap_or(state.input_clock_ms);
     let history: Vec<(i32, i32, u64)> = state.raw_motion_history.iter().copied().collect();
-    if let Some(event) = extract_best_near_miss(&history, success_t, state.detector.config()) {
+    if let Some(event) = extract_best_near_miss(&history, success_t, state.coordinator.circle.config())
+    {
         push_feedback_event(state, event);
     }
     state.last_trigger_metrics = stroke_metrics_ending_at(state, success_t);
