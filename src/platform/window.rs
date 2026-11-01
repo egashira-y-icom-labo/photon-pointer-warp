@@ -590,10 +590,10 @@ fn draw_hud(
     );
 }
 
-const HINT_TEXT_R: u8 = 64;
-const HINT_TEXT_G: u8 = 128;
-const HINT_TEXT_B: u8 = 144;
-const HINT_TEXT_A: u8 = 200;
+const HINT_TEXT_R: u8 = 110;
+const HINT_TEXT_G: u8 = 195;
+const HINT_TEXT_B: u8 = 225;
+const HINT_TEXT_A: u8 = 230;
 
 unsafe fn draw_suggestion_hint(
     dc: HDC,
@@ -620,7 +620,7 @@ unsafe fn draw_suggestion_hint(
     let repair = rect;
 
     let font = CreateFontW(
-        12,
+        -16,
         0,
         0,
         0,

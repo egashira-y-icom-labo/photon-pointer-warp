@@ -12,8 +12,9 @@ pub const DISMISS_OUT_OF_BOUNDS_MARGIN_PX: i32 = 50;
 /// 提案ヒントをパネル下端から離す距離（描画専用、ヒットテスト非使用）。
 pub const SUGGESTION_HINT_BELOW_GAP_PX: i32 = 10;
 /// 下にはみ出すときの上側ギャップ。
-pub const SUGGESTION_HINT_ABOVE_GAP_PX: i32 = 20;
-pub const SUGGESTION_HINT_HEIGHT_PX: i32 = 16;
+pub const SUGGESTION_HINT_ABOVE_GAP_PX: i32 = 28;
+pub const SUGGESTION_HINT_HEIGHT_PX: i32 = 24;
+pub const SUGGESTION_HINT_WIDTH_PX: i32 = 290;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PanelScreenRect {
@@ -27,21 +28,35 @@ pub struct PanelScreenRect {
 /// 提案ヒントの画面矩形。セル幾何には使わない。下に収まらなければ上へ反転する。
 pub fn suggestion_hint_rect(panel: PanelScreenRect, vs: VirtualScreen) -> PanelScreenRect {
     let vs_bottom = vs.y + vs.height;
+    let vs_right = vs.x + vs.width;
+    let center_x = (panel.left + panel.right) / 2;
+    let half = SUGGESTION_HINT_WIDTH_PX / 2;
+    let mut left = center_x - half;
+    let mut right = left + SUGGESTION_HINT_WIDTH_PX;
+    if left < vs.x {
+        left = vs.x;
+        right = left + SUGGESTION_HINT_WIDTH_PX;
+    }
+    if right > vs_right {
+        right = vs_right;
+        left = (right - SUGGESTION_HINT_WIDTH_PX).max(vs.x);
+    }
+
     let below_top = panel.bottom + SUGGESTION_HINT_BELOW_GAP_PX;
     let below_bottom = below_top + SUGGESTION_HINT_HEIGHT_PX;
     if below_bottom <= vs_bottom {
         PanelScreenRect {
-            left: panel.left,
+            left,
             top: below_top,
-            right: panel.right,
+            right,
             bottom: below_bottom,
         }
     } else {
         let top = (panel.top - SUGGESTION_HINT_ABOVE_GAP_PX - SUGGESTION_HINT_HEIGHT_PX).max(vs.y);
         PanelScreenRect {
-            left: panel.left,
+            left,
             top,
-            right: panel.right,
+            right,
             bottom: top + SUGGESTION_HINT_HEIGHT_PX,
         }
     }
@@ -299,10 +314,11 @@ mod tests {
             bottom: 280,
         };
         let hint = suggestion_hint_rect(panel, vs);
-        assert_eq!(hint.left, 100);
-        assert_eq!(hint.right, 280);
+        assert_eq!(hint.left, 45);
+        assert_eq!(hint.right, 335);
+        assert_eq!(hint.right - hint.left, SUGGESTION_HINT_WIDTH_PX);
         assert_eq!(hint.top, 290);
-        assert_eq!(hint.bottom, 306);
+        assert_eq!(hint.bottom, 314);
     }
 
     #[test]
@@ -320,8 +336,9 @@ mod tests {
             bottom: 1080,
         };
         let hint = suggestion_hint_rect(panel, vs);
-        assert_eq!(hint.bottom, 880);
-        assert_eq!(hint.top, 864);
+        assert_eq!(hint.bottom, 872);
+        assert_eq!(hint.top, 848);
+        assert_eq!(hint.right - hint.left, SUGGESTION_HINT_WIDTH_PX);
         assert!(hint.bottom <= panel.top);
         assert!(hint.top >= vs.y);
     }
