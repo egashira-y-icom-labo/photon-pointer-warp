@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use photon_pointer_warp::domain::circle::{CircleDetector, DetectorConfig, GestureWindowStats, MotionSample};
+use photon_pointer_warp::domain::circle::{CircleDetector, GestureWindowStats, MotionSample};
+use photon_pointer_warp::domain::config::AppConfig;
 use photon_pointer_warp::platform::layout::warp_target_for_cell;
 use photon_pointer_warp::platform::window::HudOverlay;
 use windows::core::w;
@@ -157,7 +158,7 @@ unsafe fn redirect_stdio_to_console() {
     }
 }
 
-pub fn run() -> io::Result<()> {
+pub fn run(config: AppConfig) -> io::Result<()> {
     let console_mode = init_console();
 
     unsafe {
@@ -223,10 +224,7 @@ pub fn run() -> io::Result<()> {
 
         APP.get_or_init(|| {
             Mutex::new(AppState {
-                detector: CircleDetector::new(DetectorConfig {
-                    allow_thumb_partial_closure: true,
-                    ..DetectorConfig::default()
-                }),
+                detector: CircleDetector::new(config.detector.clone()),
                 last_input_at: None,
                 buttons_down: 0,
                 pending_arc_debug: None,

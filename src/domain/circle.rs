@@ -1,5 +1,7 @@
 //! サークル・ジェスチャ検知（純 Rust / Win32 非依存）
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MotionSample {
     pub dx: f32,
@@ -7,7 +9,8 @@ pub struct MotionSample {
     pub dt_millis: u64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DetectorConfig {
     /// 角度・半径を評価するスライディング時間窓（ミリ秒）
     pub window_ms: u64,
@@ -22,6 +25,11 @@ pub struct DetectorConfig {
     pub ellipse_major_over_minor_max: f32,
     /// 230〜280° の短い親指ストロークを、緩い閉合で成立させる（実機向け）
     pub allow_thumb_partial_closure: bool,
+    /// 始点–終点距離の許容: `disp <= max(rms * factor, min_px)`
+    pub closure_rms_factor: f32,
+    pub closure_disp_min_px: f32,
+    /// 最終→最初の Δθ は、始点–終点がほぼ一致したときだけ加算
+    pub closure_angle_disp_max_px: f32,
 }
 
 impl Default for DetectorConfig {
@@ -34,15 +42,18 @@ impl Default for DetectorConfig {
             max_rms_radius: 2000.0,
             ellipse_major_over_minor_max: 3.6,
             allow_thumb_partial_closure: false,
+            closure_rms_factor: 0.65,
+            closure_disp_min_px: 10.0,
+            closure_angle_disp_max_px: 2.5,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy)]
-struct TimedDelta {
-    dx: f32,
-    dy: f32,
-    end_time_ms: u64,
+pub(crate) struct TimedDelta {
+    pub dx: f32,
+    pub dy: f32,
+    pub end_time_ms: u64,
 }
 
 pub struct CircleDetector {
@@ -190,6 +201,8 @@ impl CircleDetector {
             disp,
             self.config.min_total_angle_deg,
             self.config.allow_thumb_partial_closure,
+            self.config.closure_rms_factor,
+            self.config.closure_disp_min_px,
         ) {
             return Some("not_closed");
         }
@@ -204,8 +217,10 @@ impl CircleDetector {
         disp: f32,
         min_total_angle_deg: f32,
         allow_thumb_partial_closure: bool,
+        closure_rms_factor: f32,
+        closure_disp_min_px: f32,
     ) -> bool {
-        let limit = closure_displacement_limit(rms);
+        let limit = closure_displacement_limit(rms, closure_rms_factor, closure_disp_min_px);
         if allow_thumb_partial_closure
             && net_angle_deg >= min_total_angle_deg
             && net_angle_deg < 280.0
@@ -222,52 +237,66 @@ impl CircleDetector {
     }
 
     fn cumulative_signed_angle_deg(&self) -> f32 {
-        let mut total_rad = 0.0_f32;
-        for i in 1..self.samples.len() {
-            let a = self.samples[i - 1];
-            let b = self.samples[i];
-            total_rad += signed_angle_rad(a.dx, a.dy, b.dx, b.dy);
-        }
-        if self.samples.len() >= 3 {
-            let positions = self.cumulative_positions();
-            let rms = rms_radius(&positions);
-            let (dx, dy) = net_displacement_from(&self.samples);
-            let disp = dx.hypot(dy);
-            if closure_angle_addition_allowed(rms, disp) {
-                let last = self.samples[self.samples.len() - 1];
-                let first = self.samples[0];
-                total_rad += signed_angle_rad(last.dx, last.dy, first.dx, first.dy);
-            }
-        }
-        total_rad.to_degrees()
+        signed_angle_deg_from_deltas(&self.samples, self.config.closure_angle_disp_max_px)
     }
 
     fn cumulative_positions(&self) -> Vec<(f32, f32)> {
-        let mut positions = Vec::with_capacity(self.samples.len());
-        let mut x = 0.0_f32;
-        let mut y = 0.0_f32;
-        for s in &self.samples {
-            x += s.dx;
-            y += s.dy;
-            positions.push((x, y));
-        }
-        positions
+        cumulative_positions_from(&self.samples)
     }
 }
 
 const MIN_VECTOR_LEN_SQ: f32 = 1e-4;
-/// 始点–終点距離の許容: `disp <= max(rms * factor, min_px)`
-const CLOSURE_RMS_FACTOR: f32 = 0.65;
-const CLOSURE_DISP_MIN_PX: f32 = 10.0;
-/// 最終→最初の Δθ は、始点–終点がほぼ一致したときだけ加算
-const CLOSURE_ANGLE_DISP_MAX_PX: f32 = 2.5;
 
-fn closure_displacement_limit(rms: f32) -> f32 {
-    (rms * CLOSURE_RMS_FACTOR).max(CLOSURE_DISP_MIN_PX)
+pub(crate) fn closure_displacement_limit(rms: f32, factor: f32, min_px: f32) -> f32 {
+    (rms * factor).max(min_px)
 }
 
-fn closure_angle_addition_allowed(_rms: f32, disp: f32) -> bool {
-    disp <= CLOSURE_ANGLE_DISP_MAX_PX
+pub(crate) fn closure_angle_addition_allowed(disp: f32, max_px: f32) -> bool {
+    disp <= max_px
+}
+
+pub(crate) fn signed_angle_deg_from_deltas(
+    samples: &[TimedDelta],
+    closure_angle_disp_max_px: f32,
+) -> f32 {
+    let mut total_rad = 0.0_f32;
+    for i in 1..samples.len() {
+        let a = samples[i - 1];
+        let b = samples[i];
+        total_rad += signed_angle_rad(a.dx, a.dy, b.dx, b.dy);
+    }
+    if samples.len() >= 3 {
+        let (dx, dy) = net_displacement_from(samples);
+        let disp = dx.hypot(dy);
+        if closure_angle_addition_allowed(disp, closure_angle_disp_max_px) {
+            let last = samples[samples.len() - 1];
+            let first = samples[0];
+            total_rad += signed_angle_rad(last.dx, last.dy, first.dx, first.dy);
+        }
+    }
+    total_rad.to_degrees()
+}
+
+pub(crate) fn unsigned_angle_deg_from_deltas(samples: &[TimedDelta]) -> f32 {
+    let mut total_rad = 0.0_f32;
+    for i in 1..samples.len() {
+        let a = samples[i - 1];
+        let b = samples[i];
+        total_rad += signed_angle_rad(a.dx, a.dy, b.dx, b.dy).abs();
+    }
+    total_rad.to_degrees()
+}
+
+pub(crate) fn cumulative_positions_from(samples: &[TimedDelta]) -> Vec<(f32, f32)> {
+    let mut positions = Vec::with_capacity(samples.len());
+    let mut x = 0.0_f32;
+    let mut y = 0.0_f32;
+    for s in samples {
+        x += s.dx;
+        y += s.dy;
+        positions.push((x, y));
+    }
+    positions
 }
 
 fn signed_angle_rad(ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
@@ -279,7 +308,7 @@ fn signed_angle_rad(ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
     cross.atan2(dot)
 }
 
-fn net_displacement_from(samples: &[TimedDelta]) -> (f32, f32) {
+pub(crate) fn net_displacement_from(samples: &[TimedDelta]) -> (f32, f32) {
     let mut x = 0.0_f32;
     let mut y = 0.0_f32;
     for s in samples {
@@ -289,7 +318,7 @@ fn net_displacement_from(samples: &[TimedDelta]) -> (f32, f32) {
     (x, y)
 }
 
-fn rms_radius(positions: &[(f32, f32)]) -> f32 {
+pub(crate) fn rms_radius(positions: &[(f32, f32)]) -> f32 {
     if positions.is_empty() {
         return 0.0;
     }
@@ -308,7 +337,7 @@ fn rms_radius(positions: &[(f32, f32)]) -> f32 {
     mean_sq.sqrt()
 }
 
-fn ellipse_aspect_ratio(positions: &[(f32, f32)]) -> f32 {
+pub(crate) fn ellipse_aspect_ratio(positions: &[(f32, f32)]) -> f32 {
     if positions.len() < 3 {
         return f32::INFINITY;
     }
