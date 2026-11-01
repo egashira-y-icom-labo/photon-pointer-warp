@@ -138,6 +138,11 @@ impl CircleDetector {
         self.clear_window();
     }
 
+    pub fn replace_config(&mut self, config: DetectorConfig) {
+        self.config = config;
+        self.reset();
+    }
+
     fn clear_window(&mut self) {
         self.virtual_time_ms = 0;
         self.samples.clear();
