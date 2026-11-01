@@ -3,7 +3,10 @@
 use std::io;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
-use crate::platform::layout::{minimap_panel_origin, VirtualScreen};
+use crate::platform::layout::{
+    minimap_cell_at, minimap_panel_origin, minimap_pin_screen_from_gesture, point_within_radius,
+    VirtualScreen, MINIMAP_CELL_PX, MINIMAP_GRID, MINIMAP_PANEL_PX, ORIGIN_CANCEL_RADIUS_PX,
+};
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -20,16 +23,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 const HUD_CLASS: windows::core::PCWSTR = w!("PhotonPointerWarpHud");
 
-/// 3×3 セル一辺（160〜200px 要件の中央値）
-pub const MINIMAP_CELL_PX: i32 = 180;
-pub const MINIMAP_GRID: i32 = 3;
-pub const MINIMAP_PANEL_PX: i32 = MINIMAP_CELL_PX * MINIMAP_GRID;
-
-const PIN_OUTER_RADIUS: i32 = 22;
-const PIN_INNER_RADIUS: i32 = 10;
-const PIN_MID_RADIUS: i32 = 16;
-/// 地縛霊マーカー上の左クリック判定（外円 + 余白）
-pub const ORIGIN_HIT_RADIUS_PX: i32 = PIN_OUTER_RADIUS + 8;
+const PIN_OUTER_RADIUS: i32 = 11;
+const PIN_INNER_RADIUS: i32 = 4;
+const PIN_MID_RADIUS: i32 = 7;
 
 static HUD_HWND: AtomicIsize = AtomicIsize::new(0);
 
@@ -37,9 +33,53 @@ pub fn note_hud_destroyed() {
     HUD_HWND.store(0, Ordering::Release);
 }
 
+/// `activate_at_cursor` 直後の座標診断（Phase A ログ用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HudActivateDiag {
+    pub gesture_x: i32,
+    pub gesture_y: i32,
+    pub pin_x: i32,
+    pub pin_y: i32,
+    pub vs: VirtualScreen,
+    pub panel_left: i32,
+    pub panel_top: i32,
+    pub panel_right: i32,
+    pub panel_bottom: i32,
+    pub dib_pin_x: i32,
+    pub dib_pin_y: i32,
+    pub dib_panel_left: i32,
+    pub dib_panel_top: i32,
+}
+
+impl HudActivateDiag {
+    pub fn format_line(&self, dpi: u32) -> String {
+        format!(
+            "[hud-diag] gesture=({}, {}) pin=({}, {}) vs=({}, {}, {}, {}) panel_screen=({}, {}, {}, {}) dib pin=({}, {}) panel=({}, {}) dpi={}",
+            self.gesture_x,
+            self.gesture_y,
+            self.pin_x,
+            self.pin_y,
+            self.vs.x,
+            self.vs.y,
+            self.vs.width,
+            self.vs.height,
+            self.panel_left,
+            self.panel_top,
+            self.panel_right,
+            self.panel_bottom,
+            self.dib_pin_x,
+            self.dib_pin_y,
+            self.dib_panel_left,
+            self.dib_panel_top,
+            dpi,
+        )
+    }
+}
+
 pub struct HudOverlay {
     hwnd: HWND,
     virtual_screen: VirtualScreen,
+    gesture_origin_screen: POINT,
     pin_screen: POINT,
     panel_screen: RECT,
     dib_dc: windows::Win32::Graphics::Gdi::HDC,
@@ -47,6 +87,7 @@ pub struct HudOverlay {
     pixels: *mut u8,
     pixel_len: usize,
     active: bool,
+    hover_cell: Option<(usize, usize)>,
 }
 
 // HWND / DIB はメッセージスレッドのみで使用する
@@ -92,6 +133,7 @@ impl HudOverlay {
         let overlay = Self {
             hwnd,
             virtual_screen: vs,
+            gesture_origin_screen: POINT::default(),
             pin_screen: POINT::default(),
             panel_screen: RECT::default(),
             dib_dc: dib.dc,
@@ -99,6 +141,7 @@ impl HudOverlay {
             pixels: dib.pixels,
             pixel_len: dib.len,
             active: false,
+            hover_cell: None,
         };
 
         overlay.present_transparent()?;
@@ -114,25 +157,43 @@ impl HudOverlay {
         self.hwnd
     }
 
-    /// サークル発火時: 地縛霊記録 → 描画 → 表示 → SetCapture
-    pub unsafe fn activate_at_cursor(&mut self) -> io::Result<()> {
-        let mut pin = POINT::default();
-        windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pin)
+    pub fn virtual_screen(&self) -> VirtualScreen {
+        self.virtual_screen
+    }
+
+    pub fn hover_cell(&self) -> Option<(usize, usize)> {
+        self.hover_cell
+    }
+
+    /// サークル発火時: ジェスチャ起点でパネルを展開し、地縛霊はミニマップ上へ射影
+    pub unsafe fn activate_at_cursor(&mut self) -> io::Result<HudActivateDiag> {
+        let mut origin = POINT::default();
+        windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut origin)
             .map_err(|e| io::Error::other(format!("GetCursorPos: {e}")))?;
 
         let (left, top) = minimap_panel_origin(
-            pin.x,
-            pin.y,
+            origin.x,
+            origin.y,
             MINIMAP_PANEL_PX,
             self.virtual_screen,
         );
-        self.pin_screen = pin;
+        self.gesture_origin_screen = origin;
+        let (pin_x, pin_y) = minimap_pin_screen_from_gesture(
+            origin.x,
+            origin.y,
+            left,
+            top,
+            MINIMAP_PANEL_PX,
+            self.virtual_screen,
+        );
+        self.pin_screen = POINT { x: pin_x, y: pin_y };
         self.panel_screen = RECT {
             left,
             top,
             right: left + MINIMAP_PANEL_PX,
             bottom: top + MINIMAP_PANEL_PX,
         };
+        self.hover_cell = None;
 
         self.redraw()?;
         let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
@@ -147,7 +208,26 @@ impl HudOverlay {
         );
         let _ = SetCapture(self.hwnd);
         self.active = true;
-        Ok(())
+        Ok(self.activation_diagnostic())
+    }
+
+    fn activation_diagnostic(&self) -> HudActivateDiag {
+        let vs = self.virtual_screen;
+        HudActivateDiag {
+            gesture_x: self.gesture_origin_screen.x,
+            gesture_y: self.gesture_origin_screen.y,
+            pin_x: self.pin_screen.x,
+            pin_y: self.pin_screen.y,
+            vs,
+            panel_left: self.panel_screen.left,
+            panel_top: self.panel_screen.top,
+            panel_right: self.panel_screen.right,
+            panel_bottom: self.panel_screen.bottom,
+            dib_pin_x: self.pin_screen.x - vs.x,
+            dib_pin_y: self.pin_screen.y - vs.y,
+            dib_panel_left: self.panel_screen.left - vs.x,
+            dib_panel_top: self.panel_screen.top - vs.y,
+        }
     }
 
     pub unsafe fn dismiss(&mut self) -> io::Result<()> {
@@ -156,18 +236,53 @@ impl HudOverlay {
         }
         let _ = ReleaseCapture();
         self.active = false;
+        self.hover_cell = None;
         clear_pixels(self.pixels, self.pixel_len);
         self.present_transparent()?;
         let _ = ShowWindow(self.hwnd, SW_HIDE);
         Ok(())
     }
 
+    pub fn origin_hit_test_screen(&self, screen_x: i32, screen_y: i32) -> bool {
+        point_within_radius(
+            screen_x,
+            screen_y,
+            self.pin_screen.x,
+            self.pin_screen.y,
+            ORIGIN_CANCEL_RADIUS_PX,
+        )
+    }
+
     pub fn origin_hit_test_client(&self, client_x: i32, client_y: i32) -> bool {
         let pin_x = self.pin_screen.x - self.virtual_screen.x;
         let pin_y = self.pin_screen.y - self.virtual_screen.y;
-        let dx = client_x - pin_x;
-        let dy = client_y - pin_y;
-        dx * dx + dy * dy <= ORIGIN_HIT_RADIUS_PX * ORIGIN_HIT_RADIUS_PX
+        point_within_radius(client_x, client_y, pin_x, pin_y, ORIGIN_CANCEL_RADIUS_PX)
+    }
+
+    pub fn minimap_cell_at_screen(&self, screen_x: i32, screen_y: i32) -> Option<(usize, usize)> {
+        minimap_cell_at(
+            screen_x,
+            screen_y,
+            self.panel_screen.left,
+            self.panel_screen.top,
+            MINIMAP_PANEL_PX,
+        )
+    }
+
+    fn hover_cell_for_screen(&self, screen_x: i32, screen_y: i32) -> Option<(usize, usize)> {
+        if self.origin_hit_test_screen(screen_x, screen_y) {
+            return None;
+        }
+        self.minimap_cell_at_screen(screen_x, screen_y)
+    }
+
+    pub fn update_hover_from_screen(&mut self, screen_x: i32, screen_y: i32) -> io::Result<()> {
+        let next = self.hover_cell_for_screen(screen_x, screen_y);
+        if next == self.hover_cell {
+            return Ok(());
+        }
+        self.hover_cell = next;
+        self.redraw()
     }
 
     fn redraw(&mut self) -> io::Result<()> {
@@ -179,6 +294,7 @@ impl HudOverlay {
             self.virtual_screen,
             self.pin_screen,
             self.panel_screen,
+            self.hover_cell,
         );
         unsafe { self.present_transparent() }
     }
@@ -306,6 +422,7 @@ fn draw_hud(
     vs: VirtualScreen,
     pin_screen: POINT,
     panel_screen: RECT,
+    hover_cell: Option<(usize, usize)>,
 ) {
     let pin_x = pin_screen.x - vs.x;
     let pin_y = pin_screen.y - vs.y;
@@ -326,8 +443,25 @@ fn draw_hud(
         200,
     );
 
+    if let Some((col, row)) = hover_cell {
+        let cell = MINIMAP_CELL_PX;
+        fill_rect_premul(
+            pixels,
+            width,
+            height,
+            panel_left + col as i32 * cell,
+            panel_top + row as i32 * cell,
+            cell,
+            cell,
+            120,
+            180,
+            255,
+            140,
+        );
+    }
+
     let cell = MINIMAP_CELL_PX;
-    for i in 1..MINIMAP_GRID {
+    for i in 1..MINIMAP_GRID as i32 {
         let x = panel_left + i * cell;
         let y = panel_top + i * cell;
         fill_rect_premul(

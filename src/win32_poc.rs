@@ -6,9 +6,10 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use photon_pointer_warp::domain::circle::{CircleDetector, DetectorConfig, GestureWindowStats, MotionSample};
+use photon_pointer_warp::platform::layout::warp_target_for_cell;
 use photon_pointer_warp::platform::window::HudOverlay;
 use windows::core::w;
-use windows::Win32::Foundation::{BOOL, GENERIC_WRITE, HWND, LPARAM, LRESULT, WPARAM, FALSE, TRUE};
+use windows::Win32::Foundation::{BOOL, GENERIC_WRITE, HWND, LPARAM, LRESULT, POINT, WPARAM, FALSE, TRUE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
@@ -21,7 +22,7 @@ use windows::Win32::System::Console::{
 const CP_UTF8: u32 = 65001;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
-    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::{
     GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
@@ -31,11 +32,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, VK_ESCAPE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    IsIconic, KillTimer, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
-    SetTimer, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, MSG, SW_HIDE, SW_RESTORE,
-    SW_SHOW, WM_CLOSE, WM_DESTROY, WM_HOTKEY, WM_INPUT, WM_KEYDOWN, WM_TIMER, WNDCLASSW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, HWND_MESSAGE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
+    IsIconic, KillTimer, PostMessageW, PostQuitMessage, RegisterClassW, SetCursorPos,
+    SetForegroundWindow, SetTimer, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, MSG,
+    SW_HIDE, SW_RESTORE, SW_SHOW, WM_CLOSE, WM_DESTROY, WM_HOTKEY, WM_INPUT, WM_KEYDOWN, WM_TIMER,
+    WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, HWND_MESSAGE,
 };
 
 enum ConsoleMode {
@@ -164,7 +165,7 @@ pub fn run() -> io::Result<()> {
             println!("Exit: Ctrl+C in this console, or close the window");
         }
     }
-    println!("Draw a circle with the trackball. HUD opens on detect; right-click / Esc / origin click to dismiss.");
+    println!("Draw a circle with the trackball. HUD: hover cells, click to warp, right-click/Esc/origin to cancel.");
     io::stdout().flush()?;
 
     unsafe {
@@ -409,13 +410,19 @@ unsafe fn handle_wm_input(lparam: LPARAM) -> io::Result<()> {
             .last_detection_stats()
             .unwrap_or_else(|| guard.detector.window_stats());
         let message_hwnd = HWND(MESSAGE_HWND.load(Ordering::Acquire) as _);
-        guard
+        let hud_diag = guard
             .hud
             .activate_at_cursor()
             .map_err(|e| io::Error::other(format!("HUD activate: {e}")))?;
+        let dpi = unsafe { GetDpiForSystem() };
+        println!("{}", hud_diag.format_line(dpi));
+        let _ = io::stdout().flush();
+        let mut cursor = POINT::default();
+        let _ = GetCursorPos(&mut cursor);
+        let _ = guard.hud.update_hover_from_screen(cursor.x, cursor.y);
         register_esc_hotkey_if_needed(message_hwnd, &mut guard)?;
         println!(
-            "[detect] Circle gesture - {:.0}deg in {}ms (HUD open; right-click / Esc / origin to dismiss)",
+            "[detect] Circle gesture - {:.0}deg in {}ms (HUD open; click cell to warp)",
             stats.net_angle_deg, stats.elapsed_ms
         );
         let _ = io::stdout().flush();
@@ -503,26 +510,84 @@ fn dismiss_hud_with_log(reason: &str) {
     let _ = io::stdout().flush();
 }
 
+fn warp_hud_to_cell(col: usize, row: usize) {
+    let raw = MESSAGE_HWND.load(Ordering::Acquire);
+    if raw == 0 {
+        return;
+    }
+    let message_hwnd = HWND(raw as _);
+    let mut guard = match APP.get().and_then(|a| a.lock().ok()) {
+        Some(g) => g,
+        None => return,
+    };
+    if !guard.hud.is_active() {
+        return;
+    }
+    let vs = guard.hud.virtual_screen();
+    let (target_x, target_y) = warp_target_for_cell(col, row, vs);
+    if let Err(e) = unsafe { SetCursorPos(target_x, target_y) } {
+        eprintln!("SetCursorPos error: {e}");
+        return;
+    }
+    if let Err(e) = unsafe { guard.hud.dismiss() } {
+        eprintln!("HUD dismiss error: {e}");
+        return;
+    }
+    unregister_esc_hotkey_state(&mut guard, message_hwnd);
+    println!("[warp] Jumped to ({target_x}, {target_y}) [cell: {col}, {row}]");
+    let _ = io::stdout().flush();
+}
+
+fn handle_hud_left_button_up() {
+    let mut point = POINT::default();
+    if unsafe { GetCursorPos(&mut point) }.is_err() {
+        return;
+    }
+    let guard = match APP.get().and_then(|a| a.lock().ok()) {
+        Some(g) => g,
+        None => return,
+    };
+    if !guard.hud.is_active() {
+        return;
+    }
+    if guard.hud.origin_hit_test_screen(point.x, point.y) {
+        drop(guard);
+        dismiss_hud_with_log("origin click");
+        return;
+    }
+    if let Some((col, row)) = guard.hud.minimap_cell_at_screen(point.x, point.y) {
+        drop(guard);
+        warp_hud_to_cell(col, row);
+        return;
+    }
+    drop(guard);
+    dismiss_hud_with_log("outside click");
+}
+
 unsafe extern "system" fn hud_wnd_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    use windows::Win32::UI::WindowsAndMessaging::{WM_DESTROY, WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_RBUTTONUP};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WM_DESTROY, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    };
 
     match msg {
-        WM_LBUTTONDOWN => {
-            let x = (lparam.0 as u32 & 0xffff) as i16 as i32;
-            let y = ((lparam.0 as u32) >> 16) as i16 as i32;
-            let guard = match APP.get().and_then(|a| a.lock().ok()) {
-                Some(g) => g,
-                None => return LRESULT(0),
-            };
-            if guard.hud.origin_hit_test_client(x, y) {
-                drop(guard);
-                dismiss_hud_with_log("origin click");
+        WM_MOUSEMOVE => {
+            let mut point = POINT::default();
+            if GetCursorPos(&mut point).is_ok() {
+                if let Some(mut guard) = APP.get().and_then(|a| a.lock().ok()) {
+                    if guard.hud.is_active() {
+                        let _ = guard.hud.update_hover_from_screen(point.x, point.y);
+                    }
+                }
             }
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            handle_hud_left_button_up();
             LRESULT(0)
         }
         WM_RBUTTONDOWN | WM_RBUTTONUP => {
