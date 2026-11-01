@@ -16,9 +16,10 @@ use photon_pointer_warp::domain::circle::{CircleDetector, GestureWindowStats, Mo
 use photon_pointer_warp::domain::config::AppConfig;
 use photon_pointer_warp::platform::calibrate_window::CALIBRATE_MUTEX_NAME;
 use photon_pointer_warp::platform::layout::warp_target_for_cell;
+use photon_pointer_warp::platform::startup;
 use photon_pointer_warp::platform::tray::{
     TrayEvent, TrayIcon, IDM_APPLY_SUGGESTION, IDM_CALIBRATE, IDM_DISMISS_SUGGESTION, IDM_EXIT,
-    IDM_PAUSE, WM_TRAYICON,
+    IDM_PAUSE, IDM_STARTUP, WM_TRAYICON,
 };
 use photon_pointer_warp::platform::window::HudOverlay;
 use windows::core::w;
@@ -575,6 +576,12 @@ fn handle_tray_command_sync(hwnd: HWND, id: u32) {
                 if let Some(tray) = guard.tray.as_mut() {
                     unsafe { tray.set_paused(paused) };
                 }
+            }
+        }
+        IDM_STARTUP => {
+            let enabled = startup::is_startup_enabled();
+            if let Err(e) = startup::set_startup_enabled(!enabled) {
+                eprintln!("startup toggle: {e}");
             }
         }
         IDM_APPLY_SUGGESTION => {

@@ -3,6 +3,7 @@
 use std::io;
 use std::mem::size_of;
 
+use crate::platform::startup;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::Shell::{
@@ -25,6 +26,7 @@ pub const IDM_PAUSE: usize = 4002;
 pub const IDM_EXIT: usize = 4003;
 pub const IDM_APPLY_SUGGESTION: usize = 4004;
 pub const IDM_DISMISS_SUGGESTION: usize = 4005;
+pub const IDM_STARTUP: usize = 4006;
 
 const TIP_ACTIVE: &str = "Photon Pointer Warp";
 const TIP_PAUSED: &str = "Photon Pointer Warp (一時停止中)";
@@ -128,6 +130,17 @@ impl TrayIcon {
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, w!(""));
         }
         let _ = AppendMenuW(menu, MF_STRING, IDM_CALIBRATE, w!("設定 / キャリブレーション..."));
+        let startup_flags = if startup::is_startup_enabled() {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING | MF_UNCHECKED
+        };
+        let _ = AppendMenuW(
+            menu,
+            startup_flags,
+            IDM_STARTUP,
+            w!("Windows 起動時に実行"),
+        );
         let pause_flags = if paused {
             MF_STRING | MF_CHECKED
         } else {
