@@ -8,13 +8,16 @@ use std::time::{Instant, SystemTime};
 
 use photon_pointer_warp::domain::circle::{CircleDetector, GestureWindowStats, MotionSample};
 use photon_pointer_warp::domain::config::AppConfig;
+use photon_pointer_warp::platform::calibrate_window::CALIBRATE_MUTEX_NAME;
 use photon_pointer_warp::platform::layout::warp_target_for_cell;
 use photon_pointer_warp::platform::tray::{
     TrayEvent, TrayIcon, IDM_CALIBRATE, IDM_EXIT, IDM_PAUSE, WM_TRAYICON,
 };
 use photon_pointer_warp::platform::window::HudOverlay;
 use windows::core::w;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, WPARAM, FALSE, TRUE};
+use windows::Win32::Foundation::{
+    CloseHandle, BOOL, HWND, LPARAM, LRESULT, POINT, WPARAM, FALSE, TRUE,
+};
 #[cfg(debug_assertions)]
 use windows::Win32::Foundation::GENERIC_WRITE;
 #[cfg(debug_assertions)]
@@ -22,17 +25,19 @@ use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::Console::{
-    SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT,
+    AttachConsole, GetConsoleWindow, SetConsoleCtrlHandler, ATTACH_PARENT_PROCESS,
+    CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT,
 };
 #[cfg(debug_assertions)]
 use windows::Win32::System::Console::{
-    AllocConsole, AttachConsole, GetConsoleWindow, SetConsoleCP, SetConsoleOutputCP,
-    SetConsoleTitleW, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    AllocConsole, SetConsoleCP, SetConsoleOutputCP, SetConsoleTitleW, SetStdHandle,
+    STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
 };
 
 #[cfg(debug_assertions)]
 const CP_UTF8: u32 = 65001;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
 use windows::Win32::UI::HiDpi::{
     GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -109,12 +114,23 @@ struct AppState {
     /// 連続ワープ着地（または最後のマウス移動）時刻。2 秒無操作でオートディスミス。
     chained_warp_started_at: Option<Instant>,
     detection_paused: bool,
+    /// キャリブレーション実行中。ユーザの一時停止とは独立。
+    calibrating: bool,
     tray: Option<TrayIcon>,
     calibrate_child: Option<Child>,
     config_mtime: Option<SystemTime>,
 }
 
 static APP: OnceLock<Mutex<AppState>> = OnceLock::new();
+
+/// 親コンソールがあるときだけ接続する。`AllocConsole` はしない（サイレント常駐を維持）。
+fn attach_parent_console() {
+    unsafe {
+        if GetConsoleWindow().0.is_null() {
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+}
 
 /// デバッグ時のみログ窓を確保し、可能なら前面に出す。
 #[cfg(debug_assertions)]
@@ -183,6 +199,8 @@ unsafe fn redirect_stdio_to_console() {
 }
 
 pub fn run(config: AppConfig) -> io::Result<()> {
+    attach_parent_console();
+
     #[cfg(debug_assertions)]
     {
         let console_mode = init_console();
@@ -261,6 +279,7 @@ pub fn run(config: AppConfig) -> io::Result<()> {
                 pending_settling: None,
                 chained_warp_started_at: None,
                 detection_paused: false,
+                calibrating: false,
                 tray: Some(tray),
                 calibrate_child: None,
                 config_mtime: config_file_mtime(),
@@ -400,6 +419,7 @@ fn reload_detector_from_disk(state: &mut AppState) {
 fn spawn_calibrate(state: &mut AppState) {
     if let Some(child) = state.calibrate_child.as_mut() {
         if matches!(child.try_wait(), Ok(None)) {
+            enter_calibrating(state);
             return;
         }
     }
@@ -407,8 +427,40 @@ fn spawn_calibrate(state: &mut AppState) {
         return;
     };
     match Command::new(exe).arg("--calibrate").spawn() {
-        Ok(child) => state.calibrate_child = Some(child),
+        Ok(child) => {
+            state.calibrate_child = Some(child);
+            enter_calibrating(state);
+        }
         Err(e) => eprintln!("failed to launch --calibrate: {e}"),
+    }
+}
+
+fn enter_calibrating(state: &mut AppState) {
+    state.calibrating = true;
+    state.pending_settling = None;
+    if !state.hud.is_active() {
+        return;
+    }
+    state.chained_warp_started_at = None;
+    if let Err(e) = unsafe { state.hud.dismiss() } {
+        eprintln!("HUD dismiss error: {e}");
+        return;
+    }
+    let raw = MESSAGE_HWND.load(Ordering::Acquire);
+    if raw != 0 {
+        unregister_esc_hotkey_state(state, HWND(raw as _));
+    }
+}
+
+fn is_calibrate_mutex_present() -> bool {
+    unsafe {
+        match OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, CALIBRATE_MUTEX_NAME) {
+            Ok(handle) => {
+                let _ = CloseHandle(handle);
+                true
+            }
+            Err(_) => false,
+        }
     }
 }
 
@@ -428,6 +480,16 @@ fn poll_config_and_calibrate_child() {
     if child_exited {
         guard.calibrate_child = None;
     }
+
+    let mutex_held = is_calibrate_mutex_present();
+    if mutex_held {
+        enter_calibrating(&mut guard);
+    } else if guard.calibrate_child.is_some() {
+        guard.calibrating = true;
+    } else {
+        guard.calibrating = false;
+    }
+
     let mtime = config_file_mtime();
     let file_changed = mtime.is_some() && mtime != guard.config_mtime;
     if child_exited || file_changed {
@@ -661,7 +723,7 @@ unsafe fn handle_wm_input(lparam: LPARAM) -> io::Result<()> {
 
     apply_button_flags(&mut guard, &mouse);
 
-    if guard.detection_paused {
+    if guard.detection_paused || guard.calibrating {
         return Ok(());
     }
 
@@ -900,9 +962,11 @@ unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> BOOL {
             let raw = MESSAGE_HWND.load(Ordering::Acquire);
             if raw != 0 {
                 let hwnd = HWND(raw as _);
-                let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+                if PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)).is_ok() {
+                    return TRUE;
+                }
             }
-            TRUE
+            FALSE
         }
         _ => FALSE,
     }

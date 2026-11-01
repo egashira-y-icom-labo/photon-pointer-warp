@@ -12,8 +12,9 @@ use crate::domain::circle::DetectorConfig;
 use crate::domain::config::AppConfig;
 use windows::core::w;
 use windows::Win32::Foundation::{
-    COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    CloseHandle, COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, InvalidateRect,
@@ -39,6 +40,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_CHILD, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
+pub const CALIBRATE_MUTEX_NAME: windows::core::PCWSTR =
+    w!("Local\\PhotonPointerWarp.Calibrating");
 const CLASS_NAME: windows::core::PCWSTR = w!("PhotonPointerWarpCalibrate");
 const CLIENT_W: i32 = 460;
 const CLIENT_H: i32 = 600;
@@ -59,6 +62,26 @@ const COLOR_LINE: (u8, u8, u8) = (80, 210, 230);
 const COLOR_FADE: (u8, u8, u8) = (50, 90, 100);
 const COLOR_FRAME_IDLE: (u8, u8, u8) = (51, 51, 51);
 const COLOR_FRAME_READY: (u8, u8, u8) = (0, 255, 255);
+
+struct CalibrateSessionMutex {
+    handle: HANDLE,
+}
+
+impl CalibrateSessionMutex {
+    fn acquire() -> io::Result<Self> {
+        let handle = unsafe { CreateMutexW(None, true, CALIBRATE_MUTEX_NAME) }
+            .map_err(|e| io::Error::other(format!("CreateMutexW: {e}")))?;
+        Ok(Self { handle })
+    }
+}
+
+impl Drop for CalibrateSessionMutex {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.handle);
+        }
+    }
+}
 
 static STATE: OnceLock<Mutex<CalibrateState>> = OnceLock::new();
 
@@ -114,6 +137,7 @@ impl CalibrateState {
 }
 
 pub fn run() -> io::Result<()> {
+    let _session = CalibrateSessionMutex::acquire()?;
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
