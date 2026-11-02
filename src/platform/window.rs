@@ -1,4 +1,4 @@
-//! 全画面レイヤード HUD（UpdateLayeredWindow + GDI DIB）
+//! 全画面レイヤード HUD（UpdateLayeredWindowIndirect + GDI DIB）
 
 use std::io;
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -18,15 +18,22 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, GetSystemMetrics, LoadCursorW, RegisterClassW, SetCursor, SetCursorPos,
-    SetWindowPos, ShowWindow, UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, HCURSOR, IDC_ARROW, HWND_TOPMOST,
-    SM_CYVIRTUALSCREEN, SM_CXVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE,
-    SW_SHOWNOACTIVATE, ULW_ALPHA, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    SetWindowPos, ShowWindow, UpdateLayeredWindowIndirect, CS_HREDRAW, CS_VREDRAW, HCURSOR,
+    IDC_ARROW, HWND_TOPMOST, SM_CYVIRTUALSCREEN, SM_CXVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, UPDATELAYEREDWINDOWINFO, WNDCLASSW,
+    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 const HUD_CLASS: windows::core::PCWSTR = w!("PhotonPointerWarpHud");
 
 const PIN_OUTER_RADIUS: i32 = 11;
+const DIRTY_PAD_PX: i32 = PIN_OUTER_RADIUS + 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HudMode {
+    Tracking,
+    Anchored,
+}
 const PIN_INNER_RADIUS: i32 = 4;
 const PIN_MID_RADIUS: i32 = 7;
 
@@ -108,6 +115,9 @@ pub struct HudOverlay {
     active: bool,
     hover_cell: Option<(usize, usize)>,
     suggestion_hint: Option<String>,
+    mode: HudMode,
+    /// 直前にクリアした DIB 座標の範囲。次フレームでここも消す。
+    last_panel_rect: Option<RECT>,
 }
 
 // HWND / DIB はメッセージスレッドのみで使用する
@@ -165,9 +175,11 @@ impl HudOverlay {
             active: false,
             hover_cell: None,
             suggestion_hint: None,
+            mode: HudMode::Anchored,
+            last_panel_rect: None,
         };
 
-        overlay.present_transparent()?;
+        overlay.present(None)?;
         let _ = ShowWindow(hwnd, SW_HIDE);
         Ok(overlay)
     }
@@ -188,6 +200,10 @@ impl HudOverlay {
         self.hover_cell
     }
 
+    pub fn mode(&self) -> HudMode {
+        self.mode
+    }
+
     /// サークル発火時: アンカー一致でパネル展開（地縛霊 ≈ 物理カーソル）
     pub unsafe fn activate_at_cursor(
         &mut self,
@@ -197,8 +213,59 @@ impl HudOverlay {
         windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut origin)
             .map_err(|e| io::Error::other(format!("GetCursorPos: {e}")))?;
 
-        self.gesture_origin_screen = origin;
-        let layout = minimap_anchor_layout(origin.x, origin.y, self.virtual_screen);
+        self.mode = HudMode::Anchored;
+        self.hover_cell = None;
+        self.suggestion_hint = suggestion_hint.map(str::to_string);
+        self.place_at(origin);
+        self.redraw()?;
+        self.show_topmost()?;
+        SetCursorPos(self.pin_screen.x, self.pin_screen.y)
+            .map_err(|e| io::Error::other(format!("SetCursorPos snap: {e}")))?;
+        self.update_hover_from_screen(self.pin_screen.x, self.pin_screen.y)?;
+        self.active = true;
+        Ok(self.activation_diagnostic())
+    }
+
+    /// シェイク追従の開始。カーソルは動かさず、ヒントとホバーは描かない。
+    pub unsafe fn activate_tracking(&mut self, cursor_pos: POINT) -> io::Result<()> {
+        self.mode = HudMode::Tracking;
+        self.hover_cell = None;
+        self.suggestion_hint = None;
+        self.place_at(cursor_pos);
+        self.redraw()?;
+        self.show_topmost()?;
+        self.active = true;
+        Ok(())
+    }
+
+    /// 追従中にパネルをカーソルへ移す。位置が同じなら描かない。
+    pub unsafe fn move_to(&mut self, cursor_pos: POINT) -> io::Result<()> {
+        if !self.active || self.mode != HudMode::Tracking {
+            return Ok(());
+        }
+        let layout = minimap_anchor_layout(cursor_pos.x, cursor_pos.y, self.virtual_screen);
+        if layout.panel_left == self.panel_screen.left
+            && layout.panel_top == self.panel_screen.top
+            && layout.pin_screen_x == self.pin_screen.x
+            && layout.pin_screen_y == self.pin_screen.y
+        {
+            return Ok(());
+        }
+        self.place_at(cursor_pos);
+        self.redraw()
+    }
+
+    /// 追従を終え、ホバーと提案ヒントを描いて固定する。
+    pub unsafe fn anchor(&mut self, hint: Option<&str>) -> io::Result<()> {
+        self.mode = HudMode::Anchored;
+        self.suggestion_hint = hint.map(str::to_string);
+        self.hover_cell = self.hover_cell_for_screen(self.pin_screen.x, self.pin_screen.y);
+        self.redraw()
+    }
+
+    fn place_at(&mut self, cursor: POINT) {
+        self.gesture_origin_screen = cursor;
+        let layout = minimap_anchor_layout(cursor.x, cursor.y, self.virtual_screen);
         self.pin_screen = POINT {
             x: layout.pin_screen_x,
             y: layout.pin_screen_y,
@@ -209,10 +276,9 @@ impl HudOverlay {
             right: layout.panel_left + MINIMAP_PANEL_PX,
             bottom: layout.panel_top + MINIMAP_PANEL_PX,
         };
-        self.hover_cell = None;
-        self.suggestion_hint = suggestion_hint.map(str::to_string);
+    }
 
-        self.redraw()?;
+    unsafe fn show_topmost(&self) -> io::Result<()> {
         let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         let _ = SetWindowPos(
             self.hwnd,
@@ -225,11 +291,7 @@ impl HudOverlay {
         );
         let _ = SetCapture(self.hwnd);
         set_arrow_cursor();
-        SetCursorPos(self.pin_screen.x, self.pin_screen.y)
-            .map_err(|e| io::Error::other(format!("SetCursorPos snap: {e}")))?;
-        self.update_hover_from_screen(self.pin_screen.x, self.pin_screen.y)?;
-        self.active = true;
-        Ok(self.activation_diagnostic())
+        Ok(())
     }
 
     fn activation_diagnostic(&self) -> HudActivateDiag {
@@ -259,8 +321,10 @@ impl HudOverlay {
         self.active = false;
         self.hover_cell = None;
         self.suggestion_hint = None;
+        self.mode = HudMode::Anchored;
         clear_pixels(self.pixels, self.pixel_len);
-        self.present_transparent()?;
+        self.last_panel_rect = None;
+        self.present(None)?;
         let _ = ShowWindow(self.hwnd, SW_HIDE);
         Ok(())
     }
@@ -320,8 +384,47 @@ impl HudOverlay {
         self.redraw()
     }
 
+    fn content_bounds_dib(&self) -> RECT {
+        let vs = self.virtual_screen;
+        let mut left = self.panel_screen.left - vs.x - DIRTY_PAD_PX;
+        let mut top = self.panel_screen.top - vs.y - DIRTY_PAD_PX;
+        let mut right = self.panel_screen.right - vs.x + DIRTY_PAD_PX;
+        let mut bottom = self.panel_screen.bottom - vs.y + DIRTY_PAD_PX;
+        if self.mode == HudMode::Anchored && self.suggestion_hint.is_some() {
+            let hint = suggestion_hint_rect(
+                PanelScreenRect {
+                    left: self.panel_screen.left,
+                    top: self.panel_screen.top,
+                    right: self.panel_screen.right,
+                    bottom: self.panel_screen.bottom,
+                },
+                vs,
+            );
+            left = left.min(hint.left - vs.x);
+            top = top.min(hint.top - vs.y);
+            right = right.max(hint.right - vs.x);
+            bottom = bottom.max(hint.bottom - vs.y);
+        }
+        RECT {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
     fn redraw(&mut self) -> io::Result<()> {
-        clear_pixels(self.pixels, self.pixel_len);
+        let next = self.content_bounds_dib();
+        let clear = match self.last_panel_rect {
+            Some(prev) => union_rect(prev, next),
+            None => next,
+        };
+        clear_rect(
+            self.pixels,
+            self.virtual_screen.width,
+            self.virtual_screen.height,
+            clear,
+        );
         draw_hud(
             self.pixels,
             self.virtual_screen.width,
@@ -331,48 +434,59 @@ impl HudOverlay {
             self.panel_screen,
             self.hover_cell,
         );
-        if let Some(summary) = self.suggestion_hint.as_deref() {
-            unsafe {
-                draw_suggestion_hint(
-                    self.dib_dc,
-                    self.pixels,
-                    self.virtual_screen,
-                    self.panel_screen,
-                    summary,
-                );
+        if self.mode == HudMode::Anchored {
+            if let Some(summary) = self.suggestion_hint.as_deref() {
+                unsafe {
+                    draw_suggestion_hint(
+                        self.dib_dc,
+                        self.pixels,
+                        self.virtual_screen,
+                        self.panel_screen,
+                        summary,
+                    );
+                }
             }
         }
-        unsafe { self.present_transparent() }
+        unsafe { self.present(Some(clear))? };
+        self.last_panel_rect = Some(next);
+        Ok(())
     }
 
-    unsafe fn present_transparent(&self) -> io::Result<()> {
+    unsafe fn present(&self, dirty: Option<RECT>) -> io::Result<()> {
+        let dst = POINT {
+            x: self.virtual_screen.x,
+            y: self.virtual_screen.y,
+        };
         let size = windows::Win32::Foundation::SIZE {
             cx: self.virtual_screen.width,
             cy: self.virtual_screen.height,
         };
-        let point_zero = POINT { x: 0, y: 0 };
+        let src = POINT { x: 0, y: 0 };
         let blend = windows::Win32::Graphics::Gdi::BLENDFUNCTION {
             BlendOp: windows::Win32::Graphics::Gdi::AC_SRC_OVER as u8,
             BlendFlags: 0,
             SourceConstantAlpha: 255,
             AlphaFormat: windows::Win32::Graphics::Gdi::AC_SRC_ALPHA as u8,
         };
-
-        UpdateLayeredWindow(
-            self.hwnd,
-            None,
-            Some(&POINT {
-                x: self.virtual_screen.x,
-                y: self.virtual_screen.y,
-            }),
-            Some(&size),
-            self.dib_dc,
-            Some(&point_zero),
-            COLORREF(0),
-            Some(&blend),
-            ULW_ALPHA,
-        )
-        .map_err(|e| io::Error::other(format!("UpdateLayeredWindow: {e}")))?;
+        let dirty_ptr = dirty
+            .as_ref()
+            .map(|rect| rect as *const RECT)
+            .unwrap_or(std::ptr::null());
+        let info = UPDATELAYEREDWINDOWINFO {
+            cbSize: std::mem::size_of::<UPDATELAYEREDWINDOWINFO>() as u32,
+            hdcDst: HDC::default(),
+            pptDst: &dst,
+            psize: &size,
+            hdcSrc: self.dib_dc,
+            pptSrc: &src,
+            crKey: COLORREF(0),
+            pblend: &blend,
+            dwFlags: ULW_ALPHA,
+            prcDirty: dirty_ptr,
+        };
+        UpdateLayeredWindowIndirect(self.hwnd, &info).ok().map_err(|e| {
+            io::Error::other(format!("UpdateLayeredWindowIndirect: {e}"))
+        })?;
         Ok(())
     }
 }
@@ -450,6 +564,35 @@ unsafe fn create_dib_section(width: i32, height: i32) -> io::Result<DibSection> 
         pixels: bits as *mut u8,
         len,
     })
+}
+
+fn union_rect(a: RECT, b: RECT) -> RECT {
+    RECT {
+        left: a.left.min(b.left),
+        top: a.top.min(b.top),
+        right: a.right.max(b.right),
+        bottom: a.bottom.max(b.bottom),
+    }
+}
+
+fn clear_rect(pixels: *mut u8, width: i32, height: i32, rect: RECT) {
+    if pixels.is_null() || width <= 0 || height <= 0 {
+        return;
+    }
+    let left = rect.left.max(0);
+    let top = rect.top.max(0);
+    let right = rect.right.min(width);
+    let bottom = rect.bottom.min(height);
+    if left >= right || top >= bottom {
+        return;
+    }
+    let row_bytes = (right - left) as usize * 4;
+    unsafe {
+        for y in top..bottom {
+            let idx = ((y * width + left) * 4) as isize;
+            std::ptr::write_bytes(pixels.offset(idx), 0, row_bytes);
+        }
+    }
 }
 
 fn clear_pixels(pixels: *mut u8, len: usize) {

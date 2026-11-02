@@ -76,6 +76,7 @@ pub enum HudCloseReason {
     OutsideClick,
     OutOfBounds,
     AutoTimeout,
+    TrackingTimeout,
 }
 
 impl HudCloseReason {
@@ -87,6 +88,7 @@ impl HudCloseReason {
             Self::OutsideClick => "outside click",
             Self::OutOfBounds => "out of bounds",
             Self::AutoTimeout => "auto timeout",
+            Self::TrackingTimeout => "tracking timeout",
         }
     }
 

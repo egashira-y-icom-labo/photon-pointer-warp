@@ -15,6 +15,7 @@ use photon_pointer_warp::domain::calibration::{analyze_relative_stroke, StrokeMe
 use photon_pointer_warp::domain::circle::{CircleDetector, GestureWindowStats, MotionSample};
 use photon_pointer_warp::domain::settle::{decide_settle, policy_for, SettleDecision};
 use photon_pointer_warp::domain::shake::ShakeDetector;
+use photon_pointer_warp::domain::tracking::{TrackingAction, TrackingController};
 use photon_pointer_warp::domain::trigger::{TriggerCoordinator, TriggerSource};
 use photon_pointer_warp::domain::config::AppConfig;
 use photon_pointer_warp::platform::calibrate_window::CALIBRATE_MUTEX_NAME;
@@ -83,8 +84,11 @@ static MESSAGE_HWND: AtomicIsize = AtomicIsize::new(0);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 const DEBUG_TIMER_ID: usize = 1;
+const TRACK_TIMER_ID: usize = 3;
 const ESC_HOTKEY_ID: i32 = 2;
 const DEBUG_TIMER_MS: u32 = 100;
+const TRACK_TIMER_MS: u32 = 16;
+const PAINT_INTERVAL_MS: u64 = 16;
 /// この時間以上入力が空いたら「ストローク終了」とみなしてデバッグログを1行出す。
 const IDLE_FLUSH_MS: u64 = 150;
 /// サンプル間隔がこれ以上空いたら前ストロークの保留ログを先にフラッシュする。
@@ -103,6 +107,16 @@ struct PendingSettling {
     is_learning_target: bool,
 }
 
+enum HudPhase {
+    Idle,
+    Settling(PendingSettling),
+    Tracking {
+        controller: TrackingController,
+        last_paint_ms: u64,
+    },
+    Anchored,
+}
+
 const CLASS_NAME: windows::core::PCWSTR = w!("PhotonPointerWarpRawInput");
 
 const RI_MOUSE_LEFT_BUTTON_DOWN: u16 = 0x0001;
@@ -119,7 +133,8 @@ struct AppState {
     pending_arc_debug: Option<(GestureWindowStats, String)>,
     hud: HudOverlay,
     esc_hotkey_registered: bool,
-    pending_settling: Option<PendingSettling>,
+    clock_origin: Instant,
+    hud_phase: HudPhase,
     /// 連続ワープ着地（または最後のマウス移動）時刻。2 秒無操作でオートディスミス。
     chained_warp_started_at: Option<Instant>,
     detection_paused: bool,
@@ -299,7 +314,8 @@ pub fn run(config: AppConfig) -> io::Result<()> {
                 pending_arc_debug: None,
                 hud,
                 esc_hotkey_registered: false,
-                pending_settling: None,
+                clock_origin: Instant::now(),
+                hud_phase: HudPhase::Idle,
                 chained_warp_started_at: None,
                 detection_paused: false,
                 calibrating: false,
@@ -368,6 +384,17 @@ unsafe extern "system" fn wnd_proc(
             if wparam.0 == DEBUG_TIMER_ID {
                 flush_pending_on_idle();
                 poll_config_and_calibrate_child();
+            } else if wparam.0 == TRACK_TIMER_ID {
+                if let Some(mut guard) = APP.get().and_then(|a| a.try_lock().ok()) {
+                    match poll_tracking(&mut guard, Instant::now()) {
+                        Ok(true) => {
+                            drop(guard);
+                            dismiss_hud_with_log(HudCloseReason::TrackingTimeout);
+                        }
+                        Err(e) => eprintln!("tracking: {e}"),
+                        Ok(false) => {}
+                    }
+                }
             }
             LRESULT(0)
         }
@@ -444,7 +471,7 @@ fn config_file_mtime() -> Option<SystemTime> {
 fn reload_detector_from_disk(state: &mut AppState) {
     let cfg = AppConfig::load_or_default();
     state.coordinator.circle.replace_config(cfg.detector);
-    state.pending_settling = None;
+    cancel_settling(state);
     state.config_mtime = config_file_mtime();
 }
 
@@ -469,7 +496,8 @@ fn spawn_calibrate(state: &mut AppState) {
 
 fn enter_calibrating(state: &mut AppState) {
     state.calibrating = true;
-    state.pending_settling = None;
+    state.hud_phase = HudPhase::Idle;
+    stop_tracking_timer();
     if !state.hud.is_active() {
         return;
     }
@@ -576,7 +604,7 @@ fn handle_tray_command_sync(hwnd: HWND, id: u32) {
             if let Some(mut guard) = APP.get().and_then(|a| a.try_lock().ok()) {
                 guard.detection_paused = !guard.detection_paused;
                 if guard.detection_paused {
-                    guard.pending_settling = None;
+                    cancel_settling(&mut guard);
                 }
                 let paused = guard.detection_paused;
                 if let Some(tray) = guard.tray.as_mut() {
@@ -630,14 +658,20 @@ fn flush_pending_on_idle() {
         flush_pending_debug(&mut guard);
     }
     let _ = try_finish_settling(&mut guard);
-    let should_dismiss_oob = guard.hud.is_active() && hud_pointer_out_of_bounds(&guard.hud);
-    let should_auto_timeout = !should_dismiss_oob
-        && guard.hud.is_active()
+    let track_dismiss = poll_tracking(&mut guard, Instant::now()).unwrap_or(false);
+    let should_dismiss_oob = !track_dismiss
+        && is_anchored(&guard)
+        && hud_pointer_out_of_bounds(&guard.hud);
+    let should_auto_timeout = !track_dismiss
+        && !should_dismiss_oob
+        && is_anchored(&guard)
         && guard
             .chained_warp_started_at
             .is_some_and(|t| chained_warp_auto_dismiss_due(t, Instant::now()));
     drop(guard);
-    if should_dismiss_oob {
+    if track_dismiss {
+        dismiss_hud_with_log(HudCloseReason::TrackingTimeout);
+    } else if should_dismiss_oob {
         dismiss_hud_with_log(HudCloseReason::OutOfBounds);
     } else if should_auto_timeout {
         dismiss_hud_with_log(HudCloseReason::AutoTimeout);
@@ -654,6 +688,108 @@ fn settling_note_motion(pending: &mut PendingSettling, dx: f32, dy: f32, now: In
     }
 }
 
+fn mono_ms(origin: Instant, now: Instant) -> u64 {
+    now.saturating_duration_since(origin).as_millis() as u64
+}
+
+fn is_anchored(state: &AppState) -> bool {
+    matches!(state.hud_phase, HudPhase::Anchored)
+}
+
+fn cancel_settling(state: &mut AppState) {
+    if matches!(state.hud_phase, HudPhase::Settling(_)) {
+        state.hud_phase = HudPhase::Idle;
+    }
+}
+
+fn stop_tracking_timer() {
+    let raw = MESSAGE_HWND.load(Ordering::Acquire);
+    if raw != 0 {
+        unsafe {
+            let _ = KillTimer(HWND(raw as _), TRACK_TIMER_ID);
+        }
+    }
+}
+
+fn begin_tracking(guard: &mut AppState, now: Instant) -> io::Result<()> {
+    let (x, y) = cursor_screen_pos().unwrap_or((0, 0));
+    let t = mono_ms(guard.clock_origin, now);
+    unsafe { guard.hud.activate_tracking(POINT { x, y })? };
+    guard.hud_phase = HudPhase::Tracking {
+        controller: TrackingController::new(t, (x, y)),
+        last_paint_ms: t,
+    };
+    guard.feedback_circle_hud = false;
+    let raw = MESSAGE_HWND.load(Ordering::Acquire);
+    if raw != 0 {
+        let hwnd = HWND(raw as _);
+        unsafe {
+            let _ = SetTimer(hwnd, TRACK_TIMER_ID, TRACK_TIMER_MS, None);
+        }
+        unsafe { register_esc_hotkey_if_needed(hwnd, guard)? };
+    }
+    println!("[detect] Shake (tracking)");
+    let _ = io::stdout().flush();
+    Ok(())
+}
+
+fn anchor_tracking(guard: &mut AppState) -> io::Result<()> {
+    if let Some((x, y)) = cursor_screen_pos() {
+        unsafe { guard.hud.move_to(POINT { x, y })? };
+    }
+    let hint = guard
+        .pending_suggestion
+        .as_ref()
+        .map(|s| s.summary.clone());
+    unsafe { guard.hud.anchor(hint.as_deref())? };
+    guard.hud_phase = HudPhase::Anchored;
+    stop_tracking_timer();
+    guard.feedback_circle_hud = false;
+    println!("[detect] Shake anchored");
+    let _ = io::stdout().flush();
+    Ok(())
+}
+
+/// `true` のとき呼び出し側が HUD を閉じる。
+fn poll_tracking(guard: &mut AppState, now: Instant) -> io::Result<bool> {
+    if !matches!(guard.hud_phase, HudPhase::Tracking { .. }) {
+        return Ok(false);
+    }
+    let Some((x, y)) = cursor_screen_pos() else {
+        return Ok(false);
+    };
+    let t = mono_ms(guard.clock_origin, now);
+    let (action, paint) = {
+        let HudPhase::Tracking {
+            controller,
+            last_paint_ms,
+        } = &mut guard.hud_phase
+        else {
+            return Ok(false);
+        };
+        let action = controller.update(t, (x, y));
+        let paint = matches!(action, TrackingAction::Continue)
+            && t.saturating_sub(*last_paint_ms) >= PAINT_INTERVAL_MS;
+        if paint {
+            *last_paint_ms = t;
+        }
+        (action, paint)
+    };
+    match action {
+        TrackingAction::Continue => {
+            if paint {
+                unsafe { guard.hud.move_to(POINT { x, y })? };
+            }
+            Ok(false)
+        }
+        TrackingAction::Anchor => {
+            anchor_tracking(guard)?;
+            Ok(false)
+        }
+        TrackingAction::TimeoutDismiss => Ok(true),
+    }
+}
+
 fn settle_decision(pending: &PendingSettling, now: Instant) -> SettleDecision {
     let elapsed_ms = now
         .saturating_duration_since(pending.started_at)
@@ -664,15 +800,28 @@ fn settle_decision(pending: &PendingSettling, now: Instant) -> SettleDecision {
     decide_settle(elapsed_ms, quiet_ms, policy_for(pending.source))
 }
 
+fn take_settling(guard: &mut AppState) -> Option<PendingSettling> {
+    if !matches!(guard.hud_phase, HudPhase::Settling(_)) {
+        return None;
+    }
+    match std::mem::replace(&mut guard.hud_phase, HudPhase::Idle) {
+        HudPhase::Settling(pending) => Some(pending),
+        other => {
+            guard.hud_phase = other;
+            None
+        }
+    }
+}
+
 fn apply_settle_decision(guard: &mut AppState, decision: SettleDecision) -> io::Result<()> {
     match decision {
         SettleDecision::Wait => Ok(()),
         SettleDecision::Open => {
-            let pending = guard.pending_settling.take().expect("pending_settling");
+            let pending = take_settling(guard).expect("pending_settling");
             open_hud_after_settle(guard, pending.source, pending.is_learning_target)
         }
         SettleDecision::Cancel => {
-            let pending = guard.pending_settling.take().expect("pending_settling");
+            let pending = take_settling(guard).expect("pending_settling");
             println!(
                 "[detect] {:?} settle cancelled (still moving)",
                 pending.source
@@ -681,6 +830,17 @@ fn apply_settle_decision(guard: &mut AppState, decision: SettleDecision) -> io::
             Ok(())
         }
     }
+}
+
+fn advance_settling(guard: &mut AppState, dx: f32, dy: f32, now: Instant) -> io::Result<()> {
+    let decision = {
+        let HudPhase::Settling(pending) = &mut guard.hud_phase else {
+            return Ok(());
+        };
+        settling_note_motion(pending, dx, dy, now);
+        settle_decision(pending, now)
+    };
+    apply_settle_decision(guard, decision)
 }
 
 fn open_hud_after_settle(
@@ -710,19 +870,15 @@ fn open_hud_after_settle(
     } else {
         guard.feedback_circle_hud = false;
     }
+    guard.hud_phase = HudPhase::Anchored;
     Ok(())
 }
 
 fn try_finish_settling(guard: &mut AppState) -> io::Result<()> {
-    let now = Instant::now();
-    let Some(decision) = guard
-        .pending_settling
-        .as_ref()
-        .map(|pending| settle_decision(pending, now))
-    else {
+    if !matches!(guard.hud_phase, HudPhase::Settling(_)) {
         return Ok(());
-    };
-    apply_settle_decision(guard, decision)
+    }
+    advance_settling(guard, 0.0, 0.0, Instant::now())
 }
 
 fn update_pending_arc_debug(state: &mut AppState) {
@@ -779,9 +935,17 @@ unsafe fn handle_wm_input(lparam: LPARAM) -> io::Result<()> {
     };
 
     if guard.hud.is_active() {
+        if matches!(guard.hud_phase, HudPhase::Tracking { .. }) {
+            let dismiss = poll_tracking(&mut guard, Instant::now())?;
+            drop(guard);
+            if dismiss {
+                dismiss_hud_with_log(HudCloseReason::TrackingTimeout);
+            }
+            return Ok(());
+        }
         let dx = mouse.lLastX as f32;
         let dy = mouse.lLastY as f32;
-        if dx != 0.0 || dy != 0.0 {
+        if is_anchored(&guard) && (dx != 0.0 || dy != 0.0) {
             if let Some((x, y)) = cursor_screen_pos() {
                 if guard.hud.pointer_beyond_dismiss_margin(x, y) {
                     drop(guard);
@@ -827,13 +991,8 @@ unsafe fn handle_wm_input(lparam: LPARAM) -> io::Result<()> {
         push_motion_history(&mut guard, dx, dy, dt_millis);
     }
 
-    if guard.pending_settling.is_some() {
-        let decision = {
-            let pending = guard.pending_settling.as_mut().expect("pending_settling");
-            settling_note_motion(pending, dx, dy, now);
-            settle_decision(pending, now)
-        };
-        apply_settle_decision(&mut guard, decision)?;
+    if matches!(guard.hud_phase, HudPhase::Settling(_)) {
+        advance_settling(&mut guard, dx, dy, now)?;
         return Ok(());
     }
 
@@ -852,15 +1011,20 @@ unsafe fn handle_wm_input(lparam: LPARAM) -> io::Result<()> {
 
     if let Some(result) = guard.coordinator.push(sample, button_down, paused, calibrating) {
         guard.pending_arc_debug = None;
-        if result.is_learning_target {
-            guard.last_fire_clock_ms = Some(guard.input_clock_ms);
+        match result.source {
+            TriggerSource::Circle => {
+                if result.is_learning_target {
+                    guard.last_fire_clock_ms = Some(guard.input_clock_ms);
+                }
+                guard.hud_phase = HudPhase::Settling(PendingSettling {
+                    started_at: now,
+                    last_significant_motion_at: now,
+                    source: result.source,
+                    is_learning_target: result.is_learning_target,
+                });
+            }
+            TriggerSource::Shake => begin_tracking(&mut guard, now)?,
         }
-        guard.pending_settling = Some(PendingSettling {
-            started_at: now,
-            last_significant_motion_at: now,
-            source: result.source,
-            is_learning_target: result.is_learning_target,
-        });
     } else {
         update_pending_arc_debug(&mut guard);
     }
@@ -989,7 +1153,7 @@ fn apply_pending_suggestion(state: &mut AppState) {
         .coordinator
         .circle
         .replace_config(suggestion.new_config);
-    state.pending_settling = None;
+    cancel_settling(state);
     state.config_mtime = config_file_mtime();
     clear_suggestion_state(state);
 }
@@ -1063,6 +1227,8 @@ fn dismiss_hud_with_log(reason: HudCloseReason) {
     }
     maybe_record_accidental(&mut guard, reason);
     clear_hud_feedback_clock(&mut guard);
+    guard.hud_phase = HudPhase::Idle;
+    stop_tracking_timer();
     guard.chained_warp_started_at = None;
     if let Err(e) = unsafe { guard.hud.dismiss() } {
         eprintln!("HUD dismiss error: {e}");
@@ -1097,6 +1263,8 @@ fn warp_hud_to_cell(col: usize, row: usize) {
         eprintln!("[hud] Failed to re-activate at landing point: {e}");
         return;
     }
+    guard.hud_phase = HudPhase::Anchored;
+    stop_tracking_timer();
     guard.chained_warp_started_at = Some(Instant::now());
     guard.hud_opened_at = Some(Instant::now());
     guard.hud_opened_cursor = cursor_screen_pos();
@@ -1108,11 +1276,20 @@ fn handle_hud_left_button_up() {
     if unsafe { GetCursorPos(&mut point) }.is_err() {
         return;
     }
-    let guard = match APP.get().and_then(|a| a.try_lock().ok()) {
+    let mut guard = match APP.get().and_then(|a| a.try_lock().ok()) {
         Some(g) => g,
         None => return,
     };
     if !guard.hud.is_active() {
+        return;
+    }
+    if matches!(guard.hud_phase, HudPhase::Tracking { .. }) {
+        if let Err(e) = anchor_tracking(&mut guard) {
+            eprintln!("anchor: {e}");
+        }
+        return;
+    }
+    if !is_anchored(&guard) {
         return;
     }
     if guard.hud.origin_hit_test_screen(point.x, point.y) {
@@ -1145,7 +1322,20 @@ unsafe extern "system" fn hud_wnd_proc(
             let mut point = POINT::default();
             if GetCursorPos(&mut point).is_ok() {
                 if let Some(mut guard) = APP.get().and_then(|a| a.try_lock().ok()) {
-                    if guard.hud.is_active() {
+                    if guard.hud.is_active()
+                        && matches!(guard.hud_phase, HudPhase::Tracking { .. })
+                    {
+                        match poll_tracking(&mut guard, Instant::now()) {
+                            Ok(true) => {
+                                drop(guard);
+                                dismiss_hud_with_log(HudCloseReason::TrackingTimeout);
+                            }
+                            Err(e) => eprintln!("tracking: {e}"),
+                            Ok(false) => {}
+                        }
+                        return LRESULT(0);
+                    }
+                    if guard.hud.is_active() && is_anchored(&guard) {
                         if guard.hud.pointer_beyond_dismiss_margin(point.x, point.y) {
                             drop(guard);
                             dismiss_hud_with_log(HudCloseReason::OutOfBounds);
