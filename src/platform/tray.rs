@@ -11,11 +11,10 @@ use windows::Win32::UI::Shell::{
     NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIcon, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos,
-    PostMessageW, SetForegroundWindow, TrackPopupMenuEx, HICON, MF_CHECKED, MF_SEPARATOR,
-    MF_STRING, MF_UNCHECKED, TPM_BOTTOMALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTALIGN,
-    TPM_RIGHTBUTTON, WM_APP,
-    WM_LBUTTONDBLCLK, WM_NULL, WM_RBUTTONUP,
+    AppendMenuW, CreateIcon, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos, PostMessageW,
+    SetForegroundWindow, TrackPopupMenuEx, HICON, MF_CHECKED, MF_SEPARATOR, MF_STRING,
+    MF_UNCHECKED, TPM_BOTTOMALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON,
+    WM_APP, WM_LBUTTONDBLCLK, WM_NULL, WM_RBUTTONUP,
 };
 
 pub const WM_TRAYICON: u32 = WM_APP + 1;
@@ -129,18 +128,18 @@ impl TrayIcon {
             );
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, w!(""));
         }
-        let _ = AppendMenuW(menu, MF_STRING, IDM_CALIBRATE, w!("設定 / キャリブレーション..."));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            IDM_CALIBRATE,
+            w!("設定 / キャリブレーション..."),
+        );
         let startup_flags = if startup::is_startup_enabled() {
             MF_STRING | MF_CHECKED
         } else {
             MF_STRING | MF_UNCHECKED
         };
-        let _ = AppendMenuW(
-            menu,
-            startup_flags,
-            IDM_STARTUP,
-            w!("Windows 起動時に実行"),
-        );
+        let _ = AppendMenuW(menu, startup_flags, IDM_STARTUP, w!("Windows 起動時に実行"));
         let pause_flags = if paused {
             MF_STRING | MF_CHECKED
         } else {
@@ -259,14 +258,6 @@ unsafe fn create_circle_icon(
             }
         }
     }
-    CreateIcon(
-        instance,
-        16,
-        16,
-        1,
-        32,
-        and_mask.as_ptr(),
-        xor.as_ptr(),
-    )
-    .map_err(|e| io::Error::other(format!("CreateIcon: {e}")))
+    CreateIcon(instance, 16, 16, 1, 32, and_mask.as_ptr(), xor.as_ptr())
+        .map_err(|e| io::Error::other(format!("CreateIcon: {e}")))
 }

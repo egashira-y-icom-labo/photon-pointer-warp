@@ -13,13 +13,15 @@ use photon_pointer_warp::domain::adaptation::{
 };
 use photon_pointer_warp::domain::calibration::{analyze_relative_stroke, StrokeMetrics};
 use photon_pointer_warp::domain::circle::{CircleDetector, GestureWindowStats, MotionSample};
+use photon_pointer_warp::domain::config::{effective_hud_style, AppConfig};
+use photon_pointer_warp::domain::monitor_layout::clamp_to_monitors;
 use photon_pointer_warp::domain::settle::{decide_settle, policy_for, SettleDecision};
 use photon_pointer_warp::domain::shake::ShakeDetector;
 use photon_pointer_warp::domain::tracking::{TrackingAction, TrackingController};
 use photon_pointer_warp::domain::trigger::{TriggerCoordinator, TriggerSource};
-use photon_pointer_warp::domain::config::AppConfig;
 use photon_pointer_warp::platform::calibrate_window::CALIBRATE_MUTEX_NAME;
 use photon_pointer_warp::platform::layout::warp_target_for_cell;
+use photon_pointer_warp::platform::monitors::{capture_display_snapshot, DisplaySnapshot};
 use photon_pointer_warp::platform::startup;
 use photon_pointer_warp::platform::tray::{
     TrayEvent, TrayIcon, IDM_APPLY_SUGGESTION, IDM_CALIBRATE, IDM_DISMISS_SUGGESTION, IDM_EXIT,
@@ -27,23 +29,23 @@ use photon_pointer_warp::platform::tray::{
 };
 use photon_pointer_warp::platform::window::HudOverlay;
 use windows::core::w;
-use windows::Win32::Foundation::{
-    CloseHandle, BOOL, HWND, LPARAM, LRESULT, POINT, WPARAM, FALSE, TRUE,
-};
 #[cfg(debug_assertions)]
 use windows::Win32::Foundation::GENERIC_WRITE;
+use windows::Win32::Foundation::{
+    CloseHandle, BOOL, FALSE, HWND, LPARAM, LRESULT, POINT, TRUE, WPARAM,
+};
 #[cfg(debug_assertions)]
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_WRITE, OPEN_EXISTING,
-};
-use windows::Win32::System::Console::{
-    AttachConsole, GetConsoleWindow, SetConsoleCtrlHandler, ATTACH_PARENT_PROCESS,
-    CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT,
 };
 #[cfg(debug_assertions)]
 use windows::Win32::System::Console::{
     AllocConsole, SetConsoleCP, SetConsoleOutputCP, SetConsoleTitleW, SetStdHandle,
     STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+};
+use windows::Win32::System::Console::{
+    AttachConsole, GetConsoleWindow, SetConsoleCtrlHandler, ATTACH_PARENT_PROCESS,
+    CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT,
 };
 
 #[cfg(debug_assertions)]
@@ -53,24 +55,22 @@ use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE}
 use windows::Win32::UI::HiDpi::{
     GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, VK_ESCAPE,
+};
 use windows::Win32::UI::Input::{
     GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
     RAWMOUSE, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEMOUSE,
-};
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, VK_ESCAPE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
     KillTimer, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetCursorPos,
     SetTimer, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, MSG, SW_HIDE, WM_CLOSE,
-    WM_DESTROY, WM_HOTKEY, WM_INPUT, WM_KEYDOWN, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_POPUP,
+    WM_DESTROY, WM_DISPLAYCHANGE, WM_HOTKEY, WM_INPUT, WM_KEYDOWN, WM_SETTINGCHANGE, WM_TIMER,
+    WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 #[cfg(debug_assertions)]
-use windows::Win32::UI::WindowsAndMessaging::{
-    IsIconic, SetForegroundWindow, SW_RESTORE, SW_SHOW,
-};
+use windows::Win32::UI::WindowsAndMessaging::{IsIconic, SetForegroundWindow, SW_RESTORE, SW_SHOW};
 
 #[cfg(debug_assertions)]
 enum ConsoleMode {
@@ -85,9 +85,11 @@ static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 const DEBUG_TIMER_ID: usize = 1;
 const TRACK_TIMER_ID: usize = 3;
+const DISPLAY_TIMER_ID: usize = 4;
 const ESC_HOTKEY_ID: i32 = 2;
 const DEBUG_TIMER_MS: u32 = 100;
 const TRACK_TIMER_MS: u32 = 16;
+const DISPLAY_DEBOUNCE_MS: u32 = 300;
 const PAINT_INTERVAL_MS: u64 = 16;
 /// この時間以上入力が空いたら「ストローク終了」とみなしてデバッグログを1行出す。
 const IDLE_FLUSH_MS: u64 = 150;
@@ -132,6 +134,8 @@ struct AppState {
     buttons_down: u32,
     pending_arc_debug: Option<(GestureWindowStats, String)>,
     hud: HudOverlay,
+    display: DisplaySnapshot,
+    hud_style: photon_pointer_warp::domain::config::HudStyle,
     esc_hotkey_registered: bool,
     clock_origin: Instant,
     hud_phase: HudPhase,
@@ -239,12 +243,18 @@ pub fn run(config: AppConfig) -> io::Result<()> {
         let console_mode = init_console();
         match console_mode {
             ConsoleMode::ParentTerminal => {
-                println!("=== photon-pointer-warp PoC (PID {}) ===", std::process::id());
+                println!(
+                    "=== photon-pointer-warp PoC (PID {}) ===",
+                    std::process::id()
+                );
                 println!("Logs go to THIS PowerShell window (no separate console).");
                 println!("Exit: tray menu or Ctrl+C");
             }
             ConsoleMode::Dedicated => {
-                println!("=== photon-pointer-warp PoC (PID {}) ===", std::process::id());
+                println!(
+                    "=== photon-pointer-warp PoC (PID {}) ===",
+                    std::process::id()
+                );
                 println!("Dedicated console opened. Exit: tray menu or Ctrl+C");
             }
         }
@@ -296,12 +306,26 @@ pub fn run(config: AppConfig) -> io::Result<()> {
         .map_err(|e| io::Error::other(format!("CreateWindowExW: {e}")))?;
 
         MESSAGE_HWND.store(hwnd.0 as isize, Ordering::Release);
-        TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Release);
+        TASKBAR_CREATED.store(
+            RegisterWindowMessageW(w!("TaskbarCreated")),
+            Ordering::Release,
+        );
 
-        let hud = HudOverlay::create(instance, hud_wnd_proc)
+        let mut hud = HudOverlay::create(instance, hud_wnd_proc)
             .map_err(|e| io::Error::other(format!("HudOverlay::create: {e}")))?;
-        let tray = TrayIcon::add(hwnd, instance)
-            .map_err(|e| io::Error::other(format!("tray: {e}")))?;
+        let display = capture_display_snapshot();
+        if !display.monitors.is_empty() && display.virtual_screen != hud.virtual_screen() {
+            hud.rebuild_display()
+                .map_err(|e| io::Error::other(format!("HUD display rebuild: {e}")))?;
+        }
+        println!(
+            "[config] hud_style={} effective={} monitors={}",
+            config.hud_style.as_str(),
+            effective_hud_style(config.hud_style, display.monitors.len()).as_str(),
+            display.monitors.len()
+        );
+        let tray =
+            TrayIcon::add(hwnd, instance).map_err(|e| io::Error::other(format!("tray: {e}")))?;
 
         APP.get_or_init(|| {
             Mutex::new(AppState {
@@ -313,6 +337,8 @@ pub fn run(config: AppConfig) -> io::Result<()> {
                 buttons_down: 0,
                 pending_arc_debug: None,
                 hud,
+                display,
+                hud_style: config.hud_style,
                 esc_hotkey_registered: false,
                 clock_origin: Instant::now(),
                 hud_phase: HudPhase::Idle,
@@ -395,7 +421,18 @@ unsafe extern "system" fn wnd_proc(
                         Ok(false) => {}
                     }
                 }
+            } else if wparam.0 == DISPLAY_TIMER_ID {
+                if let Some(mut guard) = APP.get().and_then(|a| a.try_lock().ok()) {
+                    let _ = KillTimer(hwnd, DISPLAY_TIMER_ID);
+                    if let Err(e) = refresh_display_if_stale(&mut guard) {
+                        eprintln!("[display] refresh failed: {e}");
+                    }
+                }
             }
+            LRESULT(0)
+        }
+        WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
+            schedule_display_refresh(hwnd);
             LRESULT(0)
         }
         WM_TRAYICON => {
@@ -420,6 +457,7 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_DESTROY => {
             let _ = KillTimer(hwnd, DEBUG_TIMER_ID);
+            let _ = KillTimer(hwnd, DISPLAY_TIMER_ID);
             if let Some(mut guard) = APP.get().and_then(|a| a.try_lock().ok()) {
                 unregister_esc_hotkey_state(&mut guard, hwnd);
                 let _ = guard.hud.dismiss();
@@ -471,8 +509,39 @@ fn config_file_mtime() -> Option<SystemTime> {
 fn reload_detector_from_disk(state: &mut AppState) {
     let cfg = AppConfig::load_or_default();
     state.coordinator.circle.replace_config(cfg.detector);
+    if cfg.hud_style != state.hud_style {
+        println!("[config] hud_style={}", cfg.hud_style.as_str());
+        let _ = io::stdout().flush();
+        state.hud_style = cfg.hud_style;
+    }
     cancel_settling(state);
     state.config_mtime = config_file_mtime();
+}
+
+fn schedule_display_refresh(hwnd: HWND) {
+    unsafe {
+        let _ = SetTimer(hwnd, DISPLAY_TIMER_ID, DISPLAY_DEBOUNCE_MS, None);
+    }
+}
+
+/// 幾何が変わって HUD を閉じたとき `true`。列挙が空のときは現状を維持する。
+fn refresh_display_if_stale(guard: &mut AppState) -> io::Result<bool> {
+    let fresh = capture_display_snapshot();
+    if fresh.monitors.is_empty() || fresh == guard.display {
+        return Ok(false);
+    }
+    let was_active = guard.hud.is_active();
+    let hwnd = HWND(MESSAGE_HWND.load(Ordering::Acquire) as _);
+    if was_active {
+        dismiss_hud_locked(guard, hwnd, HudCloseReason::DisplayChanged);
+    }
+    if fresh.virtual_screen != guard.hud.virtual_screen() {
+        unsafe { guard.hud.rebuild_display()? };
+    }
+    println!("[display] monitors refreshed ({})", fresh.monitors.len());
+    let _ = io::stdout().flush();
+    guard.display = fresh;
+    Ok(was_active)
 }
 
 fn spawn_calibrate(state: &mut AppState) {
@@ -572,10 +641,7 @@ fn handle_tray_callback(lparam: LPARAM) {
                 (
                     guard.detection_paused,
                     tray.hwnd(),
-                    guard
-                        .pending_suggestion
-                        .as_ref()
-                        .map(|s| s.summary.clone()),
+                    guard.pending_suggestion.as_ref().map(|s| s.summary.clone()),
                 )
             };
 
@@ -659,9 +725,8 @@ fn flush_pending_on_idle() {
     }
     let _ = try_finish_settling(&mut guard);
     let track_dismiss = poll_tracking(&mut guard, Instant::now()).unwrap_or(false);
-    let should_dismiss_oob = !track_dismiss
-        && is_anchored(&guard)
-        && hud_pointer_out_of_bounds(&guard.hud);
+    let should_dismiss_oob =
+        !track_dismiss && is_anchored(&guard) && hud_pointer_out_of_bounds(&guard.hud);
     let should_auto_timeout = !track_dismiss
         && !should_dismiss_oob
         && is_anchored(&guard)
@@ -712,6 +777,8 @@ fn stop_tracking_timer() {
 }
 
 fn begin_tracking(guard: &mut AppState, now: Instant) -> io::Result<()> {
+    let _ = refresh_display_if_stale(guard)?;
+    bind_hud_map(guard);
     let (x, y) = cursor_screen_pos().unwrap_or((0, 0));
     let t = mono_ms(guard.clock_origin, now);
     unsafe { guard.hud.activate_tracking(POINT { x, y })? };
@@ -737,10 +804,7 @@ fn anchor_tracking(guard: &mut AppState) -> io::Result<()> {
     if let Some((x, y)) = cursor_screen_pos() {
         unsafe { guard.hud.move_to(POINT { x, y })? };
     }
-    let hint = guard
-        .pending_suggestion
-        .as_ref()
-        .map(|s| s.summary.clone());
+    let hint = guard.pending_suggestion.as_ref().map(|s| s.summary.clone());
     unsafe { guard.hud.anchor(hint.as_deref())? };
     guard.hud_phase = HudPhase::Anchored;
     stop_tracking_timer();
@@ -778,6 +842,7 @@ fn poll_tracking(guard: &mut AppState, now: Instant) -> io::Result<bool> {
     match action {
         TrackingAction::Continue => {
             if paint {
+                bind_hud_map(guard);
                 unsafe { guard.hud.move_to(POINT { x, y })? };
             }
             Ok(false)
@@ -848,11 +913,10 @@ fn open_hud_after_settle(
     source: TriggerSource,
     is_learning_target: bool,
 ) -> io::Result<()> {
+    let _ = refresh_display_if_stale(guard)?;
+    bind_hud_map(guard);
     let message_hwnd = HWND(MESSAGE_HWND.load(Ordering::Acquire) as _);
-    let hint = guard
-        .pending_suggestion
-        .as_ref()
-        .map(|s| s.summary.clone());
+    let hint = guard.pending_suggestion.as_ref().map(|s| s.summary.clone());
     let hud_diag = unsafe {
         guard
             .hud
@@ -897,13 +961,7 @@ unsafe fn handle_wm_input(lparam: LPARAM) -> io::Result<()> {
     let header_size = std::mem::size_of::<RAWINPUTHEADER>() as u32;
 
     let mut size = 0u32;
-    let _ = GetRawInputData(
-        hraw,
-        RID_INPUT,
-        None,
-        &mut size,
-        header_size,
-    );
+    let _ = GetRawInputData(hraw, RID_INPUT, None, &mut size, header_size);
 
     if size == 0 {
         return Ok(());
@@ -1009,7 +1067,10 @@ unsafe fn handle_wm_input(lparam: LPARAM) -> io::Result<()> {
     let paused = guard.detection_paused;
     let calibrating = guard.calibrating;
 
-    if let Some(result) = guard.coordinator.push(sample, button_down, paused, calibrating) {
+    if let Some(result) = guard
+        .coordinator
+        .push(sample, button_down, paused, calibrating)
+    {
         guard.pending_arc_debug = None;
         match result.source {
             TriggerSource::Circle => {
@@ -1093,9 +1154,11 @@ const FEEDBACK_EVENT_CAP: usize = 10;
 
 fn push_motion_history(state: &mut AppState, dx: f32, dy: f32, dt_millis: u64) {
     state.input_clock_ms = state.input_clock_ms.saturating_add(dt_millis.max(1));
-    state
-        .raw_motion_history
-        .push_back((dx.round() as i32, dy.round() as i32, state.input_clock_ms));
+    state.raw_motion_history.push_back((
+        dx.round() as i32,
+        dy.round() as i32,
+        state.input_clock_ms,
+    ));
     while let Some((_, _, t)) = state.raw_motion_history.front() {
         if state.input_clock_ms.saturating_sub(*t) > MOTION_HISTORY_MS {
             state.raw_motion_history.pop_front();
@@ -1173,7 +1236,8 @@ fn stroke_metrics_ending_at(state: &AppState, end_ms: u64) -> Option<StrokeMetri
 fn note_circle_hud_opened(state: &mut AppState) {
     let success_t = state.last_fire_clock_ms.unwrap_or(state.input_clock_ms);
     let history: Vec<(i32, i32, u64)> = state.raw_motion_history.iter().copied().collect();
-    if let Some(event) = extract_best_near_miss(&history, success_t, state.coordinator.circle.config())
+    if let Some(event) =
+        extract_best_near_miss(&history, success_t, state.coordinator.circle.config())
     {
         push_feedback_event(state, event);
     }
@@ -1222,11 +1286,15 @@ fn dismiss_hud_with_log(reason: HudCloseReason) {
         Some(g) => g,
         None => return,
     };
+    dismiss_hud_locked(&mut guard, message_hwnd, reason);
+}
+
+fn dismiss_hud_locked(guard: &mut AppState, message_hwnd: HWND, reason: HudCloseReason) {
     if !guard.hud.is_active() {
         return;
     }
-    maybe_record_accidental(&mut guard, reason);
-    clear_hud_feedback_clock(&mut guard);
+    maybe_record_accidental(guard, reason);
+    clear_hud_feedback_clock(guard);
     guard.hud_phase = HudPhase::Idle;
     stop_tracking_timer();
     guard.chained_warp_started_at = None;
@@ -1234,9 +1302,15 @@ fn dismiss_hud_with_log(reason: HudCloseReason) {
         eprintln!("HUD dismiss error: {e}");
         return;
     }
-    unregister_esc_hotkey_state(&mut guard, message_hwnd);
+    unregister_esc_hotkey_state(guard, message_hwnd);
     println!("[hud] dismissed ({})", reason.as_str());
     let _ = io::stdout().flush();
+}
+
+fn bind_hud_map(guard: &mut AppState) {
+    let style = guard.hud_style;
+    let monitors = guard.display.monitors.clone();
+    guard.hud.prepare_map(style, &monitors);
 }
 
 fn warp_hud_to_cell(col: usize, row: usize) {
@@ -1247,18 +1321,47 @@ fn warp_hud_to_cell(col: usize, row: usize) {
     if !guard.hud.is_active() {
         return;
     }
+    match refresh_display_if_stale(&mut guard) {
+        Ok(true) => {
+            println!("[warp] skipped; display changed");
+            let _ = io::stdout().flush();
+            return;
+        }
+        Err(e) => {
+            eprintln!("[display] refresh failed: {e}");
+            return;
+        }
+        Ok(false) => {}
+    }
     let vs = guard.hud.virtual_screen();
-    let (target_x, target_y) = warp_target_for_cell(col, row, vs);
+    let raw = warp_target_for_cell(col, row, vs);
+    let (target_x, target_y) = clamp_to_monitors(raw, &guard.display.monitors);
+    if (target_x, target_y) != raw {
+        println!(
+            "[warp] clamped ({}, {}) -> ({target_x}, {target_y})",
+            raw.0, raw.1
+        );
+    }
+    drop(guard);
+    warp_hud_to_point(target_x, target_y, format!("cell: {col}, {row}"));
+}
+
+fn warp_hud_to_point(target_x: i32, target_y: i32, detail: String) {
+    let mut guard = match APP.get().and_then(|a| a.try_lock().ok()) {
+        Some(g) => g,
+        None => return,
+    };
+    if !guard.hud.is_active() {
+        return;
+    }
     if let Err(e) = unsafe { SetCursorPos(target_x, target_y) } {
         eprintln!("SetCursorPos error: {e}");
         return;
     }
-    println!("[warp] Jumped to ({target_x}, {target_y}) [cell: {col}, {row}]");
+    println!("[warp] Jumped to ({target_x}, {target_y}) [{detail}]");
     let _ = io::stdout().flush();
-    let hint = guard
-        .pending_suggestion
-        .as_ref()
-        .map(|s| s.summary.clone());
+    bind_hud_map(&mut guard);
+    let hint = guard.pending_suggestion.as_ref().map(|s| s.summary.clone());
     if let Err(e) = unsafe { guard.hud.activate_at_cursor(hint.as_deref()) } {
         eprintln!("[hud] Failed to re-activate at landing point: {e}");
         return;
@@ -1297,6 +1400,19 @@ fn handle_hud_left_button_up() {
         dismiss_hud_with_log(HudCloseReason::OriginClick);
         return;
     }
+    if guard.hud.uses_monitor_map() {
+        if let Some((index, target)) = guard.hud.monitor_target_at_screen(point.x, point.y) {
+            drop(guard);
+            warp_hud_to_point(target.0, target.1, format!("monitor {}", index + 1));
+            return;
+        }
+        if guard.hud.screen_in_panel(point.x, point.y) {
+            return;
+        }
+        drop(guard);
+        dismiss_hud_with_log(HudCloseReason::OutsideClick);
+        return;
+    }
     if let Some((col, row)) = guard.hud.minimap_cell_at_screen(point.x, point.y) {
         drop(guard);
         warp_hud_to_cell(col, row);
@@ -1322,8 +1438,7 @@ unsafe extern "system" fn hud_wnd_proc(
             let mut point = POINT::default();
             if GetCursorPos(&mut point).is_ok() {
                 if let Some(mut guard) = APP.get().and_then(|a| a.try_lock().ok()) {
-                    if guard.hud.is_active()
-                        && matches!(guard.hud_phase, HudPhase::Tracking { .. })
+                    if guard.hud.is_active() && matches!(guard.hud_phase, HudPhase::Tracking { .. })
                     {
                         match poll_tracking(&mut guard, Instant::now()) {
                             Ok(true) => {

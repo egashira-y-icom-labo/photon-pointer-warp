@@ -79,12 +79,7 @@ mod tests {
     #[test]
     fn reversal_pause_keeps_tracking() {
         let mut tracker = TrackingController::new(0, (0, 0));
-        let path = [
-            (25, (50, 0)),
-            (40, (50, 0)),
-            (70, (50, 0)),
-            (100, (20, 0)),
-        ];
+        let path = [(25, (50, 0)), (40, (50, 0)), (70, (50, 0)), (100, (20, 0))];
         for (t, pos) in path {
             assert_eq!(
                 tracker.update(t, pos),

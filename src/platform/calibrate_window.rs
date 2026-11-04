@@ -14,7 +14,6 @@ use windows::core::w;
 use windows::Win32::Foundation::{
     CloseHandle, COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
-use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, InvalidateRect,
@@ -23,14 +22,15 @@ use windows::Win32::Graphics::Gdi::{
     PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::Input::{
     GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
     RID_INPUT, RIM_TYPEMOUSE,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetClientRect, GetCursorPos, GetMessageW, GetSystemMetrics, KillTimer, LoadCursorW,
@@ -40,8 +40,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_CHILD, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
-pub const CALIBRATE_MUTEX_NAME: windows::core::PCWSTR =
-    w!("Local\\PhotonPointerWarp.Calibrating");
+pub const CALIBRATE_MUTEX_NAME: windows::core::PCWSTR = w!("Local\\PhotonPointerWarp.Calibrating");
 const CLASS_NAME: windows::core::PCWSTR = w!("PhotonPointerWarpCalibrate");
 const CLIENT_W: i32 = 460;
 const CLIENT_H: i32 = 600;

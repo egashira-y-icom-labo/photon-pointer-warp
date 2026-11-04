@@ -23,6 +23,37 @@ fn poc_detector() -> DetectorConfig {
     }
 }
 
+fn default_hud_style() -> HudStyle {
+    HudStyle::Monitors
+}
+
+/// HUD の目標表現。描画の切り替えは後続ステップで使い、今は設定として保持する。
+/// モニターが 1 枚以下のときの実効値は [`effective_hud_style`] が `"grid"` に倒す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HudStyle {
+    Monitors,
+    Grid,
+}
+
+impl HudStyle {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Monitors => "monitors",
+            Self::Grid => "grid",
+        }
+    }
+}
+
+/// 単一画面では 3×3 を使い、複数画面のときだけ設定値に従う。
+pub fn effective_hud_style(style: HudStyle, monitor_count: usize) -> HudStyle {
+    if monitor_count <= 1 {
+        HudStyle::Grid
+    } else {
+        style
+    }
+}
+
 /// 常駐・キャリブレーション共通のアプリ設定。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -30,6 +61,8 @@ pub struct AppConfig {
     pub version: u32,
     #[serde(default = "poc_detector")]
     pub detector: DetectorConfig,
+    #[serde(default = "default_hud_style")]
+    pub hud_style: HudStyle,
 }
 
 impl Default for AppConfig {
@@ -37,6 +70,7 @@ impl Default for AppConfig {
         Self {
             version: CONFIG_VERSION,
             detector: poc_detector(),
+            hud_style: default_hud_style(),
         }
     }
 }
@@ -100,6 +134,31 @@ mod tests {
         assert_eq!(cfg.detector.window_ms, 550);
         assert_eq!(cfg.detector.closure_rms_factor, 0.65);
         assert_eq!(cfg.detector.closure_disp_min_px, 10.0);
+        assert_eq!(cfg.hud_style, HudStyle::Monitors);
+    }
+
+    #[test]
+    fn missing_hud_style_defaults_to_monitors() {
+        let parsed: AppConfig = toml::from_str("version = 1\n").unwrap();
+        assert_eq!(parsed.hud_style, HudStyle::Monitors);
+        assert!(parsed.detector.allow_thumb_partial_closure);
+    }
+
+    #[test]
+    fn hud_style_roundtrip_and_single_monitor_fallback() {
+        let mut cfg = AppConfig::default();
+        cfg.hud_style = HudStyle::Grid;
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(text.contains("hud_style = \"grid\""));
+        let parsed: AppConfig = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.hud_style, HudStyle::Grid);
+        assert_eq!(effective_hud_style(HudStyle::Monitors, 1), HudStyle::Grid);
+        assert_eq!(effective_hud_style(HudStyle::Monitors, 0), HudStyle::Grid);
+        assert_eq!(
+            effective_hud_style(HudStyle::Monitors, 2),
+            HudStyle::Monitors
+        );
+        assert_eq!(effective_hud_style(HudStyle::Grid, 3), HudStyle::Grid);
     }
 
     #[test]
@@ -133,10 +192,8 @@ mod tests {
 
     #[test]
     fn save_to_then_load_from() {
-        let dir = std::env::temp_dir().join(format!(
-            "photon-pointer-warp-config-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("photon-pointer-warp-config-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
@@ -152,9 +209,6 @@ mod tests {
     fn default_path_ends_with_config_toml() {
         let path = AppConfig::default_path();
         assert_eq!(path.file_name().unwrap(), "config.toml");
-        assert!(path
-            .parent()
-            .unwrap()
-            .ends_with("photon-pointer-warp"));
+        assert!(path.parent().unwrap().ends_with("photon-pointer-warp"));
     }
 }

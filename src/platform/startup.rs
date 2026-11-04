@@ -10,8 +10,7 @@ use windows::Win32::System::Registry::{
     HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ, REG_VALUE_TYPE,
 };
 
-const RUN_SUBKEY: windows::core::PCWSTR =
-    w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+const RUN_SUBKEY: windows::core::PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const VALUE_NAME: windows::core::PCWSTR = w!("PhotonPointerWarp");
 
 struct OpenKey(HKEY);
@@ -97,16 +96,8 @@ fn utf16_le_to_string(buf: &[u8]) -> String {
 fn query_startup_command(key: HKEY) -> Option<String> {
     let mut ty = REG_VALUE_TYPE::default();
     let mut size = 0u32;
-    let status = unsafe {
-        RegQueryValueExW(
-            key,
-            VALUE_NAME,
-            None,
-            Some(&mut ty),
-            None,
-            Some(&mut size),
-        )
-    };
+    let status =
+        unsafe { RegQueryValueExW(key, VALUE_NAME, None, Some(&mut ty), None, Some(&mut size)) };
     if status != ERROR_SUCCESS || size == 0 {
         return None;
     }
@@ -184,8 +175,14 @@ mod tests {
     #[test]
     fn paths_match_ignores_quotes_and_case() {
         let current = PathBuf::from(r"C:\Tools\photon-pointer-warp.exe");
-        assert!(paths_match(r#""c:\tools\photon-pointer-warp.exe""#, &current));
+        assert!(paths_match(
+            r#""c:\tools\photon-pointer-warp.exe""#,
+            &current
+        ));
         assert!(paths_match(r"C:\Tools\photon-pointer-warp.exe", &current));
-        assert!(!paths_match(r#""C:\Other\photon-pointer-warp.exe""#, &current));
+        assert!(!paths_match(
+            r#""C:\Other\photon-pointer-warp.exe""#,
+            &current
+        ));
     }
 }

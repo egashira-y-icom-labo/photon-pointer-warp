@@ -3,36 +3,59 @@
 use std::io;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
+use crate::domain::config::{effective_hud_style, HudStyle};
+use crate::domain::monitor_layout::{panel_limits, MinimapGeometry, Monitor, Rect};
 use crate::platform::layout::{
-    is_pointer_out_of_bounds, minimap_anchor_layout, minimap_cell_at, point_within_radius,
-    suggestion_hint_rect, PanelScreenRect, VirtualScreen, DISMISS_OUT_OF_BOUNDS_MARGIN_PX,
-    MINIMAP_CELL_PX, MINIMAP_GRID, MINIMAP_PANEL_PX, ORIGIN_CANCEL_RADIUS_PX,
+    anchor_panel_within, grid_pin_offsets, is_pointer_out_of_bounds, minimap_cell_at,
+    point_within_radius, suggestion_hint_rect, PanelScreenRect, VirtualScreen,
+    DISMISS_OUT_OF_BOUNDS_MARGIN_PX, MINIMAP_CELL_PX, MINIMAP_GRID, MINIMAP_PANEL_PX,
+    ORIGIN_CANCEL_RADIUS_PX,
 };
+use crate::platform::monitors::dpi_at_screen;
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateFontW, DeleteDC, DeleteObject, DrawTextW, SelectObject, SetBkMode,
-    SetTextColor, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DEFAULT_CHARSET, DIB_RGB_COLORS,
-    DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, FW_NORMAL, HDC, TRANSPARENT,
+    SetTextColor, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER,
+    DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HDC, HGDIOBJ, TRANSPARENT,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, GetSystemMetrics, LoadCursorW, RegisterClassW, SetCursor, SetCursorPos,
     SetWindowPos, ShowWindow, UpdateLayeredWindowIndirect, CS_HREDRAW, CS_VREDRAW, HCURSOR,
-    IDC_ARROW, HWND_TOPMOST, SM_CYVIRTUALSCREEN, SM_CXVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, UPDATELAYEREDWINDOWINFO, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    HWND_TOPMOST, IDC_ARROW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA,
+    UPDATELAYEREDWINDOWINFO, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 const HUD_CLASS: windows::core::PCWSTR = w!("PhotonPointerWarpHud");
 
 const PIN_OUTER_RADIUS: i32 = 11;
 const DIRTY_PAD_PX: i32 = PIN_OUTER_RADIUS + 2;
+const PANEL_LONG_PX: i32 = 280;
+const PANEL_SHORT_PX: i32 = 90;
+const PANEL_PAD_PX: i32 = 6;
+const PANEL_LONG_MAX_PX: i32 = 560;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HudMode {
     Tracking,
     Anchored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MonitorHover {
+    index: usize,
+    panel_x: i32,
+    panel_y: i32,
+}
+
+struct MapCache {
+    w: i32,
+    h: i32,
+    pixels: Vec<u8>,
+    generation: u64,
+    highlight: Option<usize>,
 }
 const PIN_INNER_RADIUS: i32 = 4;
 const PIN_MID_RADIUS: i32 = 7;
@@ -112,12 +135,25 @@ pub struct HudOverlay {
     dib_bitmap: windows::Win32::Graphics::Gdi::HBITMAP,
     pixels: *mut u8,
     pixel_len: usize,
+    dib_prev: HGDIOBJ,
     active: bool,
     hover_cell: Option<(usize, usize)>,
     suggestion_hint: Option<String>,
     mode: HudMode,
+    requested_style: HudStyle,
+    map_style: HudStyle,
+    monitors: Vec<Monitor>,
+    geometry: Option<MinimapGeometry>,
+    panel_w: i32,
+    panel_h: i32,
+    dpi: u32,
+    map_generation: u64,
+    monitor_hover: Option<MonitorHover>,
+    map_cache: Option<MapCache>,
     /// 直前にクリアした DIB 座標の範囲。次フレームでここも消す。
     last_panel_rect: Option<RECT>,
+    /// レイヤード窓へ一度だけ転送したヒント矩形。再転送すると ULW_ALPHA が重ね塗りする。
+    hint_presented_rect: Option<RECT>,
 }
 
 // HWND / DIB はメッセージスレッドのみで使用する
@@ -172,11 +208,23 @@ impl HudOverlay {
             dib_bitmap: dib.bitmap,
             pixels: dib.pixels,
             pixel_len: dib.len,
+            dib_prev: dib.prev,
             active: false,
             hover_cell: None,
             suggestion_hint: None,
             mode: HudMode::Anchored,
+            requested_style: HudStyle::Grid,
+            map_style: HudStyle::Grid,
+            monitors: Vec::new(),
+            geometry: None,
+            panel_w: MINIMAP_PANEL_PX,
+            panel_h: MINIMAP_PANEL_PX,
+            dpi: 96,
+            map_generation: 0,
+            monitor_hover: None,
+            map_cache: None,
             last_panel_rect: None,
+            hint_presented_rect: None,
         };
 
         overlay.present(None)?;
@@ -196,8 +244,133 @@ impl HudOverlay {
         self.virtual_screen
     }
 
-    pub fn hover_cell(&self) -> Option<(usize, usize)> {
-        self.hover_cell
+    /// 仮想画面の位置か大きさが変わったあと、DIB とレイヤード窓を作り直す。
+    /// 表示中ならキャプチャを外して隠す。呼び出し側が HUD フェーズを Idle にする。
+    pub unsafe fn rebuild_display(&mut self) -> io::Result<()> {
+        let vs = query_virtual_screen();
+        let dib = create_dib_section(vs.width, vs.height)?;
+        self.destroy_dib();
+        self.dib_dc = dib.dc;
+        self.dib_bitmap = dib.bitmap;
+        self.dib_prev = dib.prev;
+        self.pixels = dib.pixels;
+        self.pixel_len = dib.len;
+        self.virtual_screen = vs;
+        self.last_panel_rect = None;
+        self.hint_presented_rect = None;
+        self.hover_cell = None;
+        self.monitor_hover = None;
+        self.suggestion_hint = None;
+        self.gesture_origin_screen = POINT::default();
+        self.pin_screen = POINT::default();
+        self.panel_screen = RECT::default();
+        self.mode = HudMode::Anchored;
+        if self.active {
+            let _ = ReleaseCapture();
+            self.active = false;
+        }
+        let _ = SetWindowPos(
+            self.hwnd,
+            HWND_TOPMOST,
+            vs.x,
+            vs.y,
+            vs.width,
+            vs.height,
+            SWP_NOACTIVATE,
+        );
+        clear_pixels(self.pixels, self.pixel_len);
+        self.present(None)?;
+        let _ = ShowWindow(self.hwnd, SW_HIDE);
+        Ok(())
+    }
+
+    unsafe fn destroy_dib(&mut self) {
+        if !self.dib_prev.0.is_null() {
+            let _ = SelectObject(self.dib_dc, self.dib_prev);
+            self.dib_prev = HGDIOBJ(std::ptr::null_mut());
+        }
+        let _ = DeleteObject(self.dib_bitmap);
+        let _ = DeleteDC(self.dib_dc);
+        self.pixels = std::ptr::null_mut();
+        self.pixel_len = 0;
+    }
+
+    /// 設定とモニター列から、3×3 かモニター配置かを決めてパネル寸法を更新する。
+    pub fn prepare_map(&mut self, style: HudStyle, monitors: &[Monitor]) {
+        let (x, y) = cursor_screen_pos();
+        let dpi = dpi_at_screen(x, y);
+        self.recompute_map(style, monitors, dpi);
+    }
+
+    fn note_cursor_dpi(&mut self) {
+        let (x, y) = cursor_screen_pos();
+        let dpi = dpi_at_screen(x, y);
+        if dpi == self.dpi {
+            return;
+        }
+        let monitors = self.monitors.clone();
+        let style = self.requested_style;
+        self.recompute_map(style, &monitors, dpi);
+    }
+
+    fn recompute_map(&mut self, style: HudStyle, monitors: &[Monitor], dpi: u32) {
+        let effective = effective_hud_style(style, monitors.len());
+        let ready = self.dpi == dpi
+            && self.requested_style == style
+            && self.monitors == monitors
+            && self.map_style == effective
+            && match effective {
+                HudStyle::Grid => self.geometry.is_none(),
+                HudStyle::Monitors => self.geometry.as_ref().is_some_and(|geo| !geo.blocks.is_empty()),
+            };
+        if ready {
+            return;
+        }
+        self.requested_style = style;
+        self.dpi = dpi.max(96);
+        self.monitors = monitors.to_vec();
+        self.map_generation = self.map_generation.wrapping_add(1);
+        self.monitor_hover = None;
+        if effective == HudStyle::Grid {
+            self.map_style = HudStyle::Grid;
+            self.geometry = None;
+            self.panel_w = MINIMAP_PANEL_PX;
+            self.panel_h = MINIMAP_PANEL_PX;
+            return;
+        }
+        let long_max = (PANEL_LONG_PX * self.dpi as i32 / 96).clamp(PANEL_LONG_PX, PANEL_LONG_MAX_PX);
+        let short_min =
+            (PANEL_SHORT_PX * self.dpi as i32 / 96).clamp(PANEL_SHORT_PX, long_max);
+        let (max_w, max_h) = panel_limits(&self.monitors, long_max, short_min);
+        let geometry = MinimapGeometry::build(&self.monitors, max_w, max_h, PANEL_PAD_PX);
+        if geometry.blocks.is_empty() {
+            self.map_style = HudStyle::Grid;
+            self.geometry = None;
+            self.panel_w = MINIMAP_PANEL_PX;
+            self.panel_h = MINIMAP_PANEL_PX;
+            return;
+        }
+        self.panel_w = geometry.panel_w;
+        self.panel_h = geometry.panel_h;
+        self.geometry = Some(geometry);
+        self.map_style = HudStyle::Monitors;
+    }
+
+    pub fn uses_monitor_map(&self) -> bool {
+        self.map_style == HudStyle::Monitors && self.geometry.is_some()
+    }
+
+    /// モニターブロック内のクリックを、その画面上の着地点へ解決する。
+    pub fn monitor_target_at_screen(&self, screen_x: i32, screen_y: i32) -> Option<(usize, (i32, i32))> {
+        if !self.uses_monitor_map() || self.origin_hit_test_screen(screen_x, screen_y) {
+            return None;
+        }
+        let local = self.panel_local(screen_x, screen_y)?;
+        self.geometry.as_ref()?.hit(local)
+    }
+
+    pub fn screen_in_panel(&self, screen_x: i32, screen_y: i32) -> bool {
+        self.panel_local(screen_x, screen_y).is_some()
     }
 
     pub fn mode(&self) -> HudMode {
@@ -215,6 +388,7 @@ impl HudOverlay {
 
         self.mode = HudMode::Anchored;
         self.hover_cell = None;
+        self.monitor_hover = None;
         self.suggestion_hint = suggestion_hint.map(str::to_string);
         self.place_at(origin);
         self.redraw()?;
@@ -230,7 +404,9 @@ impl HudOverlay {
     pub unsafe fn activate_tracking(&mut self, cursor_pos: POINT) -> io::Result<()> {
         self.mode = HudMode::Tracking;
         self.hover_cell = None;
+        self.monitor_hover = None;
         self.suggestion_hint = None;
+        self.hint_presented_rect = None;
         self.place_at(cursor_pos);
         self.redraw()?;
         self.show_topmost()?;
@@ -243,11 +419,14 @@ impl HudOverlay {
         if !self.active || self.mode != HudMode::Tracking {
             return Ok(());
         }
-        let layout = minimap_anchor_layout(cursor_pos.x, cursor_pos.y, self.virtual_screen);
+        self.note_cursor_dpi();
+        let layout = self.layout_for(cursor_pos);
         if layout.panel_left == self.panel_screen.left
             && layout.panel_top == self.panel_screen.top
             && layout.pin_screen_x == self.pin_screen.x
             && layout.pin_screen_y == self.pin_screen.y
+            && self.panel_screen.right - self.panel_screen.left == self.panel_w
+            && self.panel_screen.bottom - self.panel_screen.top == self.panel_h
         {
             return Ok(());
         }
@@ -264,8 +443,9 @@ impl HudOverlay {
     }
 
     fn place_at(&mut self, cursor: POINT) {
+        self.note_cursor_dpi();
         self.gesture_origin_screen = cursor;
-        let layout = minimap_anchor_layout(cursor.x, cursor.y, self.virtual_screen);
+        let layout = self.layout_for(cursor);
         self.pin_screen = POINT {
             x: layout.pin_screen_x,
             y: layout.pin_screen_y,
@@ -273,9 +453,60 @@ impl HudOverlay {
         self.panel_screen = RECT {
             left: layout.panel_left,
             top: layout.panel_top,
-            right: layout.panel_left + MINIMAP_PANEL_PX,
-            bottom: layout.panel_top + MINIMAP_PANEL_PX,
+            right: layout.panel_left + self.panel_w,
+            bottom: layout.panel_top + self.panel_h,
         };
+    }
+
+    fn layout_for(&self, cursor: POINT) -> crate::platform::layout::MinimapAnchorLayout {
+        let (pin_dx, pin_dy) = if self.uses_monitor_map() {
+            self.geometry
+                .as_ref()
+                .map(|geo| geo.screen_to_panel((cursor.x, cursor.y)))
+                .unwrap_or((0, 0))
+        } else {
+            grid_pin_offsets(cursor.x, cursor.y, self.virtual_screen)
+        };
+        let (left, top, width, height) = self.placement_bounds(cursor);
+        anchor_panel_within(
+            cursor.x,
+            cursor.y,
+            pin_dx,
+            pin_dy,
+            self.panel_w,
+            self.panel_h,
+            left,
+            top,
+            width,
+            height,
+        )
+    }
+
+    fn placement_bounds(&self, cursor: POINT) -> (i32, i32, i32, i32) {
+        if let Some(monitor) = self
+            .monitors
+            .iter()
+            .find(|monitor| monitor.rect.contains((cursor.x, cursor.y)))
+        {
+            return (
+                monitor.rect.left,
+                monitor.rect.top,
+                monitor.rect.width(),
+                monitor.rect.height(),
+            );
+        }
+        let vs = self.virtual_screen;
+        (vs.x, vs.y, vs.width, vs.height)
+    }
+
+    fn panel_local(&self, screen_x: i32, screen_y: i32) -> Option<(i32, i32)> {
+        let x = screen_x - self.panel_screen.left;
+        let y = screen_y - self.panel_screen.top;
+        if x < 0 || y < 0 || x >= self.panel_w || y >= self.panel_h {
+            None
+        } else {
+            Some((x, y))
+        }
     }
 
     unsafe fn show_topmost(&self) -> io::Result<()> {
@@ -320,10 +551,12 @@ impl HudOverlay {
         let _ = ReleaseCapture();
         self.active = false;
         self.hover_cell = None;
+        self.monitor_hover = None;
         self.suggestion_hint = None;
         self.mode = HudMode::Anchored;
         clear_pixels(self.pixels, self.pixel_len);
         self.last_panel_rect = None;
+        self.hint_presented_rect = None;
         self.present(None)?;
         let _ = ShowWindow(self.hwnd, SW_HIDE);
         Ok(())
@@ -376,6 +609,14 @@ impl HudOverlay {
     }
 
     pub fn update_hover_from_screen(&mut self, screen_x: i32, screen_y: i32) -> io::Result<()> {
+        if self.uses_monitor_map() {
+            let next = self.monitor_hover_at(screen_x, screen_y);
+            if next == self.monitor_hover {
+                return Ok(());
+            }
+            self.monitor_hover = next;
+            return self.redraw();
+        }
         let next = self.hover_cell_for_screen(screen_x, screen_y);
         if next == self.hover_cell {
             return Ok(());
@@ -384,71 +625,115 @@ impl HudOverlay {
         self.redraw()
     }
 
-    fn content_bounds_dib(&self) -> RECT {
-        let vs = self.virtual_screen;
-        let mut left = self.panel_screen.left - vs.x - DIRTY_PAD_PX;
-        let mut top = self.panel_screen.top - vs.y - DIRTY_PAD_PX;
-        let mut right = self.panel_screen.right - vs.x + DIRTY_PAD_PX;
-        let mut bottom = self.panel_screen.bottom - vs.y + DIRTY_PAD_PX;
-        if self.mode == HudMode::Anchored && self.suggestion_hint.is_some() {
-            let hint = suggestion_hint_rect(
-                PanelScreenRect {
-                    left: self.panel_screen.left,
-                    top: self.panel_screen.top,
-                    right: self.panel_screen.right,
-                    bottom: self.panel_screen.bottom,
-                },
-                vs,
-            );
-            left = left.min(hint.left - vs.x);
-            top = top.min(hint.top - vs.y);
-            right = right.max(hint.right - vs.x);
-            bottom = bottom.max(hint.bottom - vs.y);
+    fn monitor_hover_at(&self, screen_x: i32, screen_y: i32) -> Option<MonitorHover> {
+        if self.origin_hit_test_screen(screen_x, screen_y) {
+            return None;
         }
+        let local = self.panel_local(screen_x, screen_y)?;
+        let (index, _) = self.geometry.as_ref()?.hit(local)?;
+        Some(MonitorHover {
+            index,
+            panel_x: local.0,
+            panel_y: local.1,
+        })
+    }
+
+    fn panel_bounds_dib(&self) -> RECT {
+        let vs = self.virtual_screen;
         RECT {
-            left,
-            top,
-            right,
-            bottom,
+            left: self.panel_screen.left - vs.x - DIRTY_PAD_PX,
+            top: self.panel_screen.top - vs.y - DIRTY_PAD_PX,
+            right: self.panel_screen.right - vs.x + DIRTY_PAD_PX,
+            bottom: self.panel_screen.bottom - vs.y + DIRTY_PAD_PX,
         }
     }
 
+    /// 固定中だけ。追従中はヒントを出さない。
+    fn hint_dib_rect(&self) -> Option<RECT> {
+        if self.mode != HudMode::Anchored || self.suggestion_hint.is_none() {
+            return None;
+        }
+        let vs = self.virtual_screen;
+        let hint = suggestion_hint_rect(
+            PanelScreenRect {
+                left: self.panel_screen.left,
+                top: self.panel_screen.top,
+                right: self.panel_screen.right,
+                bottom: self.panel_screen.bottom,
+            },
+            vs,
+        );
+        Some(RECT {
+            left: hint.left - vs.x,
+            top: hint.top - vs.y,
+            right: hint.right - vs.x,
+            bottom: hint.bottom - vs.y,
+        })
+    }
+
     fn redraw(&mut self) -> io::Result<()> {
-        let next = self.content_bounds_dib();
-        let clear = match self.last_panel_rect {
-            Some(prev) => union_rect(prev, next),
-            None => next,
+        let panel = self.panel_bounds_dib();
+        let hint = self.hint_dib_rect();
+        // 同じ矩形を ULW_ALPHA の dirty で再送すると、既存の文字の上に再度ブレンドされる。
+        let draw_hint = hint.is_some() && hint != self.hint_presented_rect;
+        let mut clear = match self.last_panel_rect {
+            Some(prev) => union_rect(prev, panel),
+            None => panel,
         };
+        if draw_hint {
+            if let Some(rect) = hint {
+                clear = union_rect(clear, rect);
+            }
+            if let Some(old) = self.hint_presented_rect {
+                clear = union_rect(clear, old);
+            }
+        }
         clear_rect(
             self.pixels,
             self.virtual_screen.width,
             self.virtual_screen.height,
             clear,
         );
-        draw_hud(
-            self.pixels,
-            self.virtual_screen.width,
-            self.virtual_screen.height,
-            self.virtual_screen,
-            self.pin_screen,
-            self.panel_screen,
-            self.hover_cell,
-        );
-        if self.mode == HudMode::Anchored {
-            if let Some(summary) = self.suggestion_hint.as_deref() {
+        if self.uses_monitor_map() {
+            self.compose_monitor_map()?;
+        } else {
+            draw_hud(
+                self.pixels,
+                self.virtual_screen.width,
+                self.virtual_screen.height,
+                self.virtual_screen,
+                self.pin_screen,
+                self.panel_screen,
+                self.hover_cell,
+            );
+        }
+        if draw_hint {
+            if let Some(summary) = self.suggestion_hint.clone() {
+                if let Some(rect) = hint {
+                    clear_rect(
+                        self.pixels,
+                        self.virtual_screen.width,
+                        self.virtual_screen.height,
+                        rect,
+                    );
+                }
                 unsafe {
                     draw_suggestion_hint(
                         self.dib_dc,
                         self.pixels,
                         self.virtual_screen,
                         self.panel_screen,
-                        summary,
+                        &summary,
                     );
                 }
             }
+            // 全画面置換にすると、移動前の文字が窓に残らない。
+            unsafe { self.present(None)? };
+            self.hint_presented_rect = hint;
+        } else {
+            unsafe { self.present(Some(clear))? };
         }
-        unsafe { self.present(Some(clear))? };
-        self.last_panel_rect = Some(next);
+        self.last_panel_rect = Some(panel);
         Ok(())
     }
 
@@ -484,9 +769,9 @@ impl HudOverlay {
             dwFlags: ULW_ALPHA,
             prcDirty: dirty_ptr,
         };
-        UpdateLayeredWindowIndirect(self.hwnd, &info).ok().map_err(|e| {
-            io::Error::other(format!("UpdateLayeredWindowIndirect: {e}"))
-        })?;
+        UpdateLayeredWindowIndirect(self.hwnd, &info)
+            .ok()
+            .map_err(|e| io::Error::other(format!("UpdateLayeredWindowIndirect: {e}")))?;
         Ok(())
     }
 }
@@ -497,8 +782,7 @@ impl Drop for HudOverlay {
             if self.active {
                 let _ = ReleaseCapture();
             }
-            let _ = DeleteObject(self.dib_bitmap);
-            let _ = DeleteDC(self.dib_dc);
+            self.destroy_dib();
         }
     }
 }
@@ -515,6 +799,7 @@ pub unsafe fn query_virtual_screen() -> VirtualScreen {
 struct DibSection {
     dc: windows::Win32::Graphics::Gdi::HDC,
     bitmap: windows::Win32::Graphics::Gdi::HBITMAP,
+    prev: HGDIOBJ,
     pixels: *mut u8,
     len: usize,
 }
@@ -554,16 +839,25 @@ unsafe fn create_dib_section(width: i32, height: i32) -> io::Result<DibSection> 
     )
     .map_err(|e| io::Error::other(format!("CreateDIBSection: {e}")))?;
 
-    let _old = SelectObject(mem_dc, bitmap);
+    let prev = SelectObject(mem_dc, bitmap);
     let len = (width as usize)
         .saturating_mul(height as usize)
         .saturating_mul(4);
     Ok(DibSection {
         dc: mem_dc,
         bitmap,
+        prev,
         pixels: bits as *mut u8,
         len,
     })
+}
+
+unsafe fn discard_dib(dib: DibSection) {
+    if !dib.prev.0.is_null() {
+        let _ = SelectObject(dib.dc, dib.prev);
+    }
+    let _ = DeleteObject(dib.bitmap);
+    let _ = DeleteDC(dib.dc);
 }
 
 fn union_rect(a: RECT, b: RECT) -> RECT {
@@ -601,6 +895,99 @@ fn clear_pixels(pixels: *mut u8, len: usize) {
     }
     unsafe {
         std::ptr::write_bytes(pixels, 0, len);
+    }
+}
+
+fn cursor_screen_pos() -> (i32, i32) {
+    let mut point = POINT::default();
+    if unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut point) }.is_err() {
+        return (0, 0);
+    }
+    (point.x, point.y)
+}
+
+impl HudOverlay {
+    fn compose_monitor_map(&mut self) -> io::Result<()> {
+        let highlight = if self.mode == HudMode::Anchored {
+            self.monitor_hover.map(|hover| hover.index)
+        } else {
+            None
+        };
+        self.ensure_map_cache(highlight)?;
+        let vs = self.virtual_screen;
+        let dest_x = self.panel_screen.left - vs.x;
+        let dest_y = self.panel_screen.top - vs.y;
+        if let Some(cache) = self.map_cache.as_ref() {
+            blit_premul(
+                self.pixels,
+                vs.width,
+                vs.height,
+                dest_x,
+                dest_y,
+                &cache.pixels,
+                cache.w,
+                cache.h,
+            );
+        }
+        if self.mode == HudMode::Anchored {
+            if let Some(hover) = self.monitor_hover {
+                draw_crosshair(
+                    self.pixels,
+                    vs.width,
+                    vs.height,
+                    dest_x + hover.panel_x,
+                    dest_y + hover.panel_y,
+                );
+            }
+        }
+        draw_pin(
+            self.pixels,
+            vs.width,
+            vs.height,
+            self.pin_screen.x - vs.x,
+            self.pin_screen.y - vs.y,
+        );
+        draw_pin_cross(
+            self.pixels,
+            vs.width,
+            vs.height,
+            self.pin_screen.x - vs.x,
+            self.pin_screen.y - vs.y,
+        );
+        Ok(())
+    }
+
+    fn ensure_map_cache(&mut self, highlight: Option<usize>) -> io::Result<()> {
+        if let Some(cache) = self.map_cache.as_ref() {
+            if cache.w == self.panel_w
+                && cache.h == self.panel_h
+                && cache.generation == self.map_generation
+                && cache.highlight == highlight
+            {
+                return Ok(());
+            }
+        }
+        let Some(geometry) = self.geometry.clone() else {
+            return Ok(());
+        };
+        let w = self.panel_w.max(1);
+        let h = self.panel_h.max(1);
+        let dib = unsafe { create_dib_section(w, h)? };
+        paint_monitor_blocks(dib.pixels, w, h, &geometry.blocks, highlight);
+        unsafe { paint_monitor_labels(dib.dc, dib.pixels, w, h, &geometry.blocks) };
+        let mut pixels = vec![0u8; dib.len];
+        unsafe {
+            std::ptr::copy_nonoverlapping(dib.pixels, pixels.as_mut_ptr(), dib.len.min(pixels.len()));
+            discard_dib(dib);
+        }
+        self.map_cache = Some(MapCache {
+            w,
+            h,
+            pixels,
+            generation: self.map_generation,
+            highlight,
+        });
+        Ok(())
     }
 }
 
@@ -733,6 +1120,223 @@ fn draw_hud(
     );
 }
 
+fn paint_monitor_blocks(
+    pixels: *mut u8,
+    width: i32,
+    height: i32,
+    blocks: &[Rect],
+    highlight: Option<usize>,
+) {
+    fill_rect_premul(pixels, width, height, 0, 0, width, height, 12, 14, 18, 176);
+    for (index, block) in blocks.iter().enumerate() {
+        let hot = highlight == Some(index);
+        let (r, g, b, a) = if hot {
+            (72, 132, 188, 220)
+        } else {
+            (34, 46, 62, 214)
+        };
+        fill_rect_premul(
+            pixels,
+            width,
+            height,
+            block.left,
+            block.top,
+            block.width(),
+            block.height(),
+            r,
+            g,
+            b,
+            a,
+        );
+        let (br, bg, bb, ba) = if hot {
+            (196, 232, 255, 240)
+        } else {
+            (118, 186, 226, 210)
+        };
+        stroke_rect_premul(
+            pixels,
+            width,
+            height,
+            block.left,
+            block.top,
+            block.width().max(1),
+            block.height().max(1),
+            br,
+            bg,
+            bb,
+            ba,
+        );
+    }
+}
+
+unsafe fn paint_monitor_labels(dc: HDC, pixels: *mut u8, width: i32, height: i32, blocks: &[Rect]) {
+    for (index, block) in blocks.iter().enumerate() {
+        if block.width() < 12 || block.height() < 12 {
+            continue;
+        }
+        let font_px = (block.height().min(block.width()) / 2).clamp(12, 28);
+        let font = CreateFontW(
+            -font_px,
+            0,
+            0,
+            0,
+            FW_NORMAL.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            0,
+            0,
+            0,
+            0,
+            w!("Segoe UI"),
+        );
+        let old_font = SelectObject(dc, font);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, COLORREF((255u32) << 16 | (244u32) << 8 | 236));
+        let mut rect = RECT {
+            left: block.left,
+            top: block.top,
+            right: block.right,
+            bottom: block.bottom,
+        };
+        let repair = rect;
+        let text = format!("{}", index + 1);
+        let mut wide: Vec<u16> = text.encode_utf16().collect();
+        let _ = DrawTextW(
+            dc,
+            &mut wide,
+            &mut rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        let _ = SelectObject(dc, old_font);
+        let _ = DeleteObject(font);
+        repair_gdi_text_alpha(
+            pixels,
+            width,
+            height,
+            repair.left,
+            repair.top,
+            repair.right,
+            repair.bottom,
+        );
+    }
+}
+
+fn draw_pin(pixels: *mut u8, width: i32, height: i32, pin_x: i32, pin_y: i32) {
+    fill_circle_premul(
+        pixels,
+        width,
+        height,
+        pin_x,
+        pin_y,
+        PIN_OUTER_RADIUS,
+        80,
+        180,
+        255,
+        90,
+    );
+    stroke_circle_premul(
+        pixels,
+        width,
+        height,
+        pin_x,
+        pin_y,
+        PIN_MID_RADIUS,
+        120,
+        200,
+        255,
+        160,
+        2,
+    );
+    fill_circle_premul(
+        pixels,
+        width,
+        height,
+        pin_x,
+        pin_y,
+        PIN_INNER_RADIUS,
+        200,
+        230,
+        255,
+        200,
+    );
+}
+
+fn draw_pin_cross(pixels: *mut u8, width: i32, height: i32, pin_x: i32, pin_y: i32) {
+    fill_rect_premul(
+        pixels,
+        width,
+        height,
+        pin_x - 7,
+        pin_y,
+        15,
+        1,
+        210,
+        240,
+        255,
+        230,
+    );
+    fill_rect_premul(
+        pixels,
+        width,
+        height,
+        pin_x,
+        pin_y - 7,
+        1,
+        15,
+        210,
+        240,
+        255,
+        230,
+    );
+}
+
+fn draw_crosshair(pixels: *mut u8, width: i32, height: i32, x: i32, y: i32) {
+    fill_rect_premul(pixels, width, height, x - 5, y, 11, 1, 255, 214, 120, 240);
+    fill_rect_premul(pixels, width, height, x, y - 5, 1, 11, 255, 214, 120, 240);
+    fill_rect_premul(pixels, width, height, x - 1, y - 1, 3, 3, 255, 236, 170, 255);
+}
+
+fn blit_premul(
+    dst: *mut u8,
+    dst_w: i32,
+    dst_h: i32,
+    dest_x: i32,
+    dest_y: i32,
+    src: &[u8],
+    src_w: i32,
+    src_h: i32,
+) {
+    if dst.is_null() || dst_w <= 0 || dst_h <= 0 || src_w <= 0 || src_h <= 0 {
+        return;
+    }
+    for row in 0..src_h {
+        let y = dest_y + row;
+        if y < 0 || y >= dst_h {
+            continue;
+        }
+        for col in 0..src_w {
+            let x = dest_x + col;
+            if x < 0 || x >= dst_w {
+                continue;
+            }
+            let src_idx = ((row * src_w + col) * 4) as usize;
+            if src_idx + 3 >= src.len() {
+                continue;
+            }
+            let dst_idx = ((y * dst_w + x) * 4) as isize;
+            unsafe {
+                let p = dst.offset(dst_idx);
+                *p = src[src_idx];
+                *p.offset(1) = src[src_idx + 1];
+                *p.offset(2) = src[src_idx + 2];
+                *p.offset(3) = src[src_idx + 3];
+            }
+        }
+    }
+}
+
 const HINT_TEXT_R: u8 = 110;
 const HINT_TEXT_G: u8 = 195;
 const HINT_TEXT_B: u8 = 225;
@@ -760,6 +1364,7 @@ unsafe fn draw_suggestion_hint(
         right: hint.right - vs.x,
         bottom: hint.bottom - vs.y,
     };
+    clear_rect(pixels, vs.width, vs.height, rect);
     let repair = rect;
 
     let font = CreateFontW(

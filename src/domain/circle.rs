@@ -153,9 +153,7 @@ impl CircleDetector {
     }
 
     fn purge_old_samples(&mut self) {
-        let cutoff = self
-            .virtual_time_ms
-            .saturating_sub(self.config.window_ms);
+        let cutoff = self.virtual_time_ms.saturating_sub(self.config.window_ms);
         self.samples.retain(|s| s.end_time_ms > cutoff);
     }
 
@@ -400,9 +398,7 @@ mod tests {
         let dt = total_ms / steps as u64;
         let dt = dt.max(1);
 
-        let pos = |theta: f32| -> (f32, f32) {
-            (r * theta.cos(), (r / aspect_y) * theta.sin())
-        };
+        let pos = |theta: f32| -> (f32, f32) { (r * theta.cos(), (r / aspect_y) * theta.sin()) };
 
         let mut samples = Vec::with_capacity(steps as usize);
         for i in 0..steps {

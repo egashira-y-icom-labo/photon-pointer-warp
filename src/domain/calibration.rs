@@ -280,7 +280,9 @@ impl CalibrateGate {
 }
 
 /// 3 本以上の有効ストロークから推奨 `DetectorConfig` を導出する（上限なし）。
-pub fn recommend_detector_config(strokes: &[StrokeMetrics]) -> Result<DetectorConfig, &'static str> {
+pub fn recommend_detector_config(
+    strokes: &[StrokeMetrics],
+) -> Result<DetectorConfig, &'static str> {
     if strokes.len() < MIN_STROKES {
         return Err("too_few_strokes");
     }
@@ -301,13 +303,9 @@ pub fn recommend_detector_config(strokes: &[StrokeMetrics]) -> Result<DetectorCo
         return Err("variance_too_high");
     }
 
-    let max_elapsed = filtered
-        .iter()
-        .map(|s| s.elapsed_ms)
-        .max()
-        .unwrap_or(0);
-    let window_ms = ((max_elapsed as f32 * WINDOW_MARGIN).round() as u64)
-        .clamp(WINDOW_MIN_MS, WINDOW_MAX_MS);
+    let max_elapsed = filtered.iter().map(|s| s.elapsed_ms).max().unwrap_or(0);
+    let window_ms =
+        ((max_elapsed as f32 * WINDOW_MARGIN).round() as u64).clamp(WINDOW_MIN_MS, WINDOW_MAX_MS);
 
     let min_angle = min_f32(&angles);
     let mean_angle = mean_f32(&angles);
@@ -333,7 +331,8 @@ pub fn recommend_detector_config(strokes: &[StrokeMetrics]) -> Result<DetectorCo
         .iter()
         .map(|s| s.closure_ratio)
         .fold(0.0_f32, f32::max);
-    let closure_rms_factor = (max_closure * CLOSURE_MARGIN).clamp(CLOSURE_FACTOR_MIN, CLOSURE_FACTOR_MAX);
+    let closure_rms_factor =
+        (max_closure * CLOSURE_MARGIN).clamp(CLOSURE_FACTOR_MIN, CLOSURE_FACTOR_MAX);
 
     let allow_thumb_partial_closure = min_angle < THUMB_PARTIAL_ANGLE_DEG;
 
@@ -460,7 +459,10 @@ mod tests {
     fn center_path_on_bounds_moves_bbox_midpoint_to_origin() {
         let path = [(10.0, 0.0), (30.0, 0.0), (30.0, 20.0), (10.0, 20.0)];
         let centered = center_path_on_bounds(&path);
-        assert_eq!(centered, [(-10.0, -10.0), (10.0, -10.0), (10.0, 10.0), (-10.0, 10.0)]);
+        assert_eq!(
+            centered,
+            [(-10.0, -10.0), (10.0, -10.0), (10.0, 10.0), (-10.0, 10.0)]
+        );
     }
 
     #[test]
@@ -532,7 +534,10 @@ mod tests {
             "net {}",
             m.net_angle_deg
         );
-        assert!(m.closure_ratio > 0.4, "partial arc should not close tightly");
+        assert!(
+            m.closure_ratio > 0.4,
+            "partial arc should not close tightly"
+        );
         assert_eq!(m.elapsed_ms, 360);
     }
 
@@ -651,15 +656,8 @@ mod tests {
     fn recommend_partial_arcs_enable_thumb_relaxation() {
         let strokes: Vec<StrokeMetrics> = (0..3)
             .map(|i| {
-                analyze_relative_stroke(&arc_samples(
-                    80.0,
-                    27,
-                    350 + i * 8,
-                    true,
-                    1.0,
-                    0.72,
-                ))
-                .unwrap()
+                analyze_relative_stroke(&arc_samples(80.0, 27, 350 + i * 8, true, 1.0, 0.72))
+                    .unwrap()
             })
             .collect();
         let cfg = recommend_detector_config(&strokes).expect("recommend partial");

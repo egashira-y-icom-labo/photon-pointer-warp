@@ -62,11 +62,7 @@ pub fn suggestion_hint_rect(panel: PanelScreenRect, vs: VirtualScreen) -> PanelS
     }
 }
 
-pub fn is_pointer_out_of_bounds(
-    cursor: (i32, i32),
-    panel: PanelScreenRect,
-    margin: i32,
-) -> bool {
+pub fn is_pointer_out_of_bounds(cursor: (i32, i32), panel: PanelScreenRect, margin: i32) -> bool {
     cursor.0 < panel.left - margin
         || cursor.0 > panel.right + margin
         || cursor.1 < panel.top - margin
@@ -90,41 +86,53 @@ pub struct MinimapAnchorLayout {
     pub pin_screen_y: i32,
 }
 
-fn gesture_pin_offsets(gesture_x: i32, gesture_y: i32, panel_size: i32, vs: VirtualScreen) -> (i32, i32) {
-    let norm_x =
-        ((gesture_x - vs.x) as f32 / vs.width.max(1) as f32).clamp(0.0, 1.0);
-    let norm_y =
-        ((gesture_y - vs.y) as f32 / vs.height.max(1) as f32).clamp(0.0, 1.0);
+fn gesture_pin_offsets(
+    gesture_x: i32,
+    gesture_y: i32,
+    panel_size: i32,
+    vs: VirtualScreen,
+) -> (i32, i32) {
+    let norm_x = ((gesture_x - vs.x) as f32 / vs.width.max(1) as f32).clamp(0.0, 1.0);
+    let norm_y = ((gesture_y - vs.y) as f32 / vs.height.max(1) as f32).clamp(0.0, 1.0);
     let pin_offset_x = (norm_x * panel_size as f32).round() as i32;
     let pin_offset_y = (norm_y * panel_size as f32).round() as i32;
     (pin_offset_x, pin_offset_y)
 }
 
-/// 地縛霊ピンが `gesture` と重なるようパネルを配置（はみ出し時のみクランプ）。
-pub fn minimap_anchor_layout(
+/// 3×3 グリッドのピンを、仮想画面上の相対位置としてパネル内に置く。
+pub fn grid_pin_offsets(gesture_x: i32, gesture_y: i32, vs: VirtualScreen) -> (i32, i32) {
+    gesture_pin_offsets(gesture_x, gesture_y, MINIMAP_PANEL_PX, vs)
+}
+
+fn clamp_panel_origin(ideal: i32, origin: i32, span: i32, panel: i32) -> i32 {
+    if span <= panel {
+        origin
+    } else {
+        ideal.clamp(origin, origin + span - panel)
+    }
+}
+
+/// ピンがジェスチャ位置に重なるようパネルを置き、矩形からはみ出さない範囲に収める。
+/// パネルが枠より大きいときは枠の左上に揃える。
+pub fn anchor_panel_within(
     gesture_x: i32,
     gesture_y: i32,
-    vs: VirtualScreen,
+    pin_offset_x: i32,
+    pin_offset_y: i32,
+    panel_w: i32,
+    panel_h: i32,
+    bounds_left: i32,
+    bounds_top: i32,
+    bounds_w: i32,
+    bounds_h: i32,
 ) -> MinimapAnchorLayout {
-    let panel_size = MINIMAP_PANEL_PX;
-    let (pin_offset_x, pin_offset_y) = gesture_pin_offsets(gesture_x, gesture_y, panel_size, vs);
-
-    let ideal_left = gesture_x - pin_offset_x;
-    let ideal_top = gesture_y - pin_offset_y;
-
-    let max_left = if vs.width > panel_size {
-        vs.x + vs.width - panel_size
-    } else {
-        vs.x
-    };
-    let max_top = if vs.height > panel_size {
-        vs.y + vs.height - panel_size
-    } else {
-        vs.y
-    };
-    let panel_left = ideal_left.clamp(vs.x, max_left);
-    let panel_top = ideal_top.clamp(vs.y, max_top);
-
+    let panel_left = clamp_panel_origin(
+        gesture_x - pin_offset_x,
+        bounds_left,
+        bounds_w,
+        panel_w,
+    );
+    let panel_top = clamp_panel_origin(gesture_y - pin_offset_y, bounds_top, bounds_h, panel_h);
     MinimapAnchorLayout {
         panel_left,
         panel_top,
@@ -133,10 +141,36 @@ pub fn minimap_anchor_layout(
     }
 }
 
+/// 地縛霊ピンが `gesture` と重なるようパネルを配置（はみ出し時のみクランプ）。
+pub fn minimap_anchor_layout(
+    gesture_x: i32,
+    gesture_y: i32,
+    vs: VirtualScreen,
+) -> MinimapAnchorLayout {
+    let (pin_offset_x, pin_offset_y) = grid_pin_offsets(gesture_x, gesture_y, vs);
+    anchor_panel_within(
+        gesture_x,
+        gesture_y,
+        pin_offset_x,
+        pin_offset_y,
+        MINIMAP_PANEL_PX,
+        MINIMAP_PANEL_PX,
+        vs.x,
+        vs.y,
+        vs.width,
+        vs.height,
+    )
+}
+
 /// 仮想デスクトップ 3×3 グリッドのセル中心座標（スクリーン座標）。
 pub fn warp_target_for_cell(col: usize, row: usize, virtual_screen: VirtualScreen) -> (i32, i32) {
     debug_assert!(col < MINIMAP_GRID && row < MINIMAP_GRID);
-    let VirtualScreen { x, y, width, height } = virtual_screen;
+    let VirtualScreen {
+        x,
+        y,
+        width,
+        height,
+    } = virtual_screen;
     let target_x = x as f32 + (col as f32 + 0.5) * (width as f32 / MINIMAP_GRID as f32);
     let target_y = y as f32 + (row as f32 + 0.5) * (height as f32 / MINIMAP_GRID as f32);
     (target_x.round() as i32, target_y.round() as i32)
@@ -341,5 +375,26 @@ mod tests {
         assert_eq!(hint.right - hint.left, SUGGESTION_HINT_WIDTH_PX);
         assert!(hint.bottom <= panel.top);
         assert!(hint.top >= vs.y);
+    }
+
+    #[test]
+    fn anchor_within_stays_inside_the_current_monitor() {
+        let (pin_x, pin_y) = (20, 30);
+        let layout = anchor_panel_within(480, 200, pin_x, pin_y, 180, 120, 100, 50, 400, 300);
+        assert_eq!(layout.panel_left, 320);
+        assert_eq!(layout.panel_top, 170);
+        assert_eq!(layout.pin_screen_x, 340);
+        assert_eq!(layout.pin_screen_y, 200);
+        assert!(layout.panel_left >= 100);
+        assert!(layout.panel_top >= 50);
+        assert!(layout.panel_left + 180 <= 500);
+        assert!(layout.panel_top + 120 <= 350);
+    }
+
+    #[test]
+    fn anchor_within_pins_oversized_panel_to_the_monitor_origin() {
+        let layout = anchor_panel_within(150, 80, 10, 10, 300, 200, 100, 40, 120, 80);
+        assert_eq!(layout.panel_left, 100);
+        assert_eq!(layout.panel_top, 40);
     }
 }

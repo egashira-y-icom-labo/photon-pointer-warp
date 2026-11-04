@@ -56,9 +56,7 @@ pub enum FeedbackEvent {
         cause: MissedCause,
     },
     /// 誤爆（展開後 300ms 以内の即座キャンセル）
-    AccidentalTrigger {
-        metrics: StrokeMetrics,
-    },
+    AccidentalTrigger { metrics: StrokeMetrics },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -77,6 +75,7 @@ pub enum HudCloseReason {
     OutOfBounds,
     AutoTimeout,
     TrackingTimeout,
+    DisplayChanged,
 }
 
 impl HudCloseReason {
@@ -89,6 +88,7 @@ impl HudCloseReason {
             Self::OutOfBounds => "out of bounds",
             Self::AutoTimeout => "auto timeout",
             Self::TrackingTimeout => "tracking timeout",
+            Self::DisplayChanged => "display changed",
         }
     }
 
@@ -256,10 +256,18 @@ pub fn generate_suggestion(
 fn apply_fn_adjustment(cfg: &mut DetectorConfig, recent: &[FeedbackEvent]) {
     match dominant_missed_cause(recent) {
         Some(MissedCause::AngleDeficit) => {
-            cfg.min_total_angle_deg =
-                step_angle(cfg.min_total_angle_deg, -ANGLE_STEP_DEG, TOTAL_ANGLE_MIN, TOTAL_ANGLE_MAX);
-            cfg.min_net_angle_deg =
-                step_angle(cfg.min_net_angle_deg, -ANGLE_STEP_DEG, NET_ANGLE_MIN, NET_ANGLE_MAX);
+            cfg.min_total_angle_deg = step_angle(
+                cfg.min_total_angle_deg,
+                -ANGLE_STEP_DEG,
+                TOTAL_ANGLE_MIN,
+                TOTAL_ANGLE_MAX,
+            );
+            cfg.min_net_angle_deg = step_angle(
+                cfg.min_net_angle_deg,
+                -ANGLE_STEP_DEG,
+                NET_ANGLE_MIN,
+                NET_ANGLE_MAX,
+            );
         }
         Some(MissedCause::TimeExceeded) => {
             cfg.window_ms = step_window(cfg.window_ms, WINDOW_RELAX_MS as i64);
@@ -291,8 +299,12 @@ fn apply_fn_adjustment(cfg: &mut DetectorConfig, recent: &[FeedbackEvent]) {
 
 fn apply_fp_adjustment(cfg: &mut DetectorConfig) {
     if cfg.min_total_angle_deg < FP_ANGLE_SOFT_CAP {
-        cfg.min_total_angle_deg =
-            step_angle(cfg.min_total_angle_deg, ANGLE_STEP_DEG, TOTAL_ANGLE_MIN, TOTAL_ANGLE_MAX);
+        cfg.min_total_angle_deg = step_angle(
+            cfg.min_total_angle_deg,
+            ANGLE_STEP_DEG,
+            TOTAL_ANGLE_MIN,
+            TOTAL_ANGLE_MAX,
+        );
         return;
     }
     if cfg.window_ms >= FP_WINDOW_MIN_TO_TIGHTEN {
@@ -372,7 +384,11 @@ fn diff_summary(before: &DetectorConfig, after: &DetectorConfig) -> Option<Strin
     let d_total = after.min_total_angle_deg - before.min_total_angle_deg;
     let d_net = after.min_net_angle_deg - before.min_net_angle_deg;
     if d_total.abs() >= 0.05 || d_net.abs() >= 0.05 {
-        let shown = if d_total.abs() >= 0.05 { d_total } else { d_net };
+        let shown = if d_total.abs() >= 0.05 {
+            d_total
+        } else {
+            d_net
+        };
         parts.push(format!("角 {:+.0}°", shown));
     }
 
@@ -524,8 +540,7 @@ mod tests {
     #[test]
     fn extract_near_miss_none_for_line() {
         let cfg = DetectorConfig::default();
-        let samples: Vec<(i32, i32, u64)> =
-            (0..20).map(|i| (8, 0, 100 + i * 10)).collect();
+        let samples: Vec<(i32, i32, u64)> = (0..20).map(|i| (8, 0, 100 + i * 10)).collect();
         assert!(extract_best_near_miss(&samples, 400, &cfg).is_none());
     }
 
@@ -634,6 +649,12 @@ mod tests {
             1100,
             2.0,
             HudCloseReason::OriginClick
+        ));
+        assert!(!is_accidental_trigger(
+            1000,
+            1100,
+            0.0,
+            HudCloseReason::DisplayChanged
         ));
     }
 }

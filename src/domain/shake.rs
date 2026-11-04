@@ -272,11 +272,9 @@ mod tests {
     #[test]
     fn test_leg_length_boundary_40_fires_39_does_not() {
         let mut at_limit = ShakeDetector::new();
-        assert!(
-            push_all(&mut at_limit, &axis_legs(40.0, 5, 400, true))
-                .iter()
-                .any(|fired| *fired)
-        );
+        assert!(push_all(&mut at_limit, &axis_legs(40.0, 5, 400, true))
+            .iter()
+            .any(|fired| *fired));
 
         let mut under = ShakeDetector::new();
         // 10+10+10+9 = 39px。40px 未満の脚は反転として確定しない。
