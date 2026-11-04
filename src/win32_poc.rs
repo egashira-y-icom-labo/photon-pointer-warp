@@ -56,7 +56,7 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, VK_ESCAPE,
+    RegisterHotKey, ReleaseCapture, UnregisterHotKey, HOT_KEY_MODIFIERS, VK_ESCAPE,
 };
 use windows::Win32::UI::Input::{
     GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
@@ -64,13 +64,15 @@ use windows::Win32::UI::Input::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
-    KillTimer, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetCursorPos,
-    SetTimer, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, MSG, SW_HIDE, WM_CLOSE,
-    WM_DESTROY, WM_DISPLAYCHANGE, WM_HOTKEY, WM_INPUT, WM_KEYDOWN, WM_SETTINGCHANGE, WM_TIMER,
-    WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    GetWindowLongPtrW, KillTimer, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
+    RegisterWindowMessageW, SetCursorPos, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
+    ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWL_EXSTYLE, MSG, PM_REMOVE, SW_HIDE,
+    WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_HOTKEY, WM_INPUT, WM_KEYDOWN, WM_LBUTTONDOWN,
+    WM_MBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCMBUTTONDBLCLK, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 #[cfg(debug_assertions)]
-use windows::Win32::UI::WindowsAndMessaging::{IsIconic, SetForegroundWindow, SW_RESTORE, SW_SHOW};
+use windows::Win32::UI::WindowsAndMessaging::{IsIconic, SW_RESTORE, SW_SHOW};
 
 #[cfg(debug_assertions)]
 enum ConsoleMode {
@@ -87,6 +89,7 @@ const DEBUG_TIMER_ID: usize = 1;
 const TRACK_TIMER_ID: usize = 3;
 const DISPLAY_TIMER_ID: usize = 4;
 const ESC_HOTKEY_ID: i32 = 2;
+const WM_OPEN_ADJUST: u32 = WM_APP + 2;
 const DEBUG_TIMER_MS: u32 = 100;
 const TRACK_TIMER_MS: u32 = 16;
 const DISPLAY_DEBOUNCE_MS: u32 = 300;
@@ -439,6 +442,12 @@ unsafe extern "system" fn wnd_proc(
             handle_tray_callback(lparam);
             LRESULT(0)
         }
+        WM_OPEN_ADJUST => {
+            unsafe { foreground_menu_owner(hwnd) };
+            open_adjust_menu();
+            unsafe { restore_menu_owner(hwnd) };
+            LRESULT(0)
+        }
         WM_HOTKEY => {
             if wparam.0 as i32 == ESC_HOTKEY_ID {
                 dismiss_hud_with_log(HudCloseReason::EscapeKey);
@@ -542,6 +551,66 @@ fn refresh_display_if_stale(guard: &mut AppState) -> io::Result<bool> {
     let _ = io::stdout().flush();
     guard.display = fresh;
     Ok(was_active)
+}
+
+unsafe fn discard_queued_mouse_clicks() {
+    let mut msg = MSG::default();
+    while PeekMessageW(&mut msg, None, WM_LBUTTONDOWN, WM_MBUTTONDBLCLK, PM_REMOVE).into() {}
+    while PeekMessageW(
+        &mut msg,
+        None,
+        WM_NCLBUTTONDOWN,
+        WM_NCMBUTTONDBLCLK,
+        PM_REMOVE,
+    )
+    .into()
+    {}
+}
+
+/// メニューの所有者を前面にする。`WS_EX_NOACTIVATE` のままだと表示直後に閉じる。
+unsafe fn foreground_menu_owner(hwnd: HWND) {
+    let _ = ReleaseCapture();
+    discard_queued_mouse_clicks();
+    let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    let _ = SetWindowLongPtrW(
+        hwnd,
+        GWL_EXSTYLE,
+        style & !(WS_EX_NOACTIVATE.0 as isize),
+    );
+    let _ = SetForegroundWindow(hwnd);
+}
+
+unsafe fn restore_menu_owner(hwnd: HWND) {
+    let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    let _ = SetWindowLongPtrW(
+        hwnd,
+        GWL_EXSTYLE,
+        style | WS_EX_NOACTIVATE.0 as isize,
+    );
+}
+
+fn open_adjust_menu() {
+    let prepared = {
+        let Some(mut guard) = APP.get().and_then(|a| a.try_lock().ok()) else {
+            return;
+        };
+        let Some(tray) = guard.tray.as_ref() else {
+            spawn_calibrate(&mut guard);
+            return;
+        };
+        Some((
+            guard.detection_paused,
+            tray.hwnd(),
+            guard.pending_suggestion.as_ref().map(|s| s.summary.clone()),
+        ))
+    };
+    let Some((paused, hwnd, suggestion)) = prepared else {
+        return;
+    };
+    let cmd_id = unsafe { TrayIcon::track_menu(hwnd, paused, suggestion.as_deref()) };
+    if cmd_id != 0 {
+        handle_tray_command_sync(hwnd, cmd_id);
+    }
 }
 
 fn spawn_calibrate(state: &mut AppState) {
@@ -1393,6 +1462,22 @@ fn handle_hud_left_button_up() {
         return;
     }
     if !is_anchored(&guard) {
+        return;
+    }
+    if guard.hud.badge_contains(point.x, point.y) {
+        drop(guard);
+        let raw = MESSAGE_HWND.load(Ordering::Acquire);
+        if raw == 0 {
+            return;
+        }
+        let hwnd = HWND(raw as _);
+        // ボタンアップの処理中に開くと、その離した操作がメニュー外クリックになる。
+        unsafe { foreground_menu_owner(hwnd) };
+        dismiss_hud_with_log(HudCloseReason::OpenAdjust);
+        let posted = unsafe { PostMessageW(hwnd, WM_OPEN_ADJUST, WPARAM(0), LPARAM(0)) };
+        if posted.is_err() {
+            unsafe { restore_menu_owner(hwnd) };
+        }
         return;
     }
     if guard.hud.origin_hit_test_screen(point.x, point.y) {

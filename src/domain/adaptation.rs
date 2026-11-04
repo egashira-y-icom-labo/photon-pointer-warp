@@ -76,6 +76,7 @@ pub enum HudCloseReason {
     AutoTimeout,
     TrackingTimeout,
     DisplayChanged,
+    OpenAdjust,
 }
 
 impl HudCloseReason {
@@ -89,6 +90,7 @@ impl HudCloseReason {
             Self::AutoTimeout => "auto timeout",
             Self::TrackingTimeout => "tracking timeout",
             Self::DisplayChanged => "display changed",
+            Self::OpenAdjust => "open adjust",
         }
     }
 

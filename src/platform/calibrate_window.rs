@@ -16,10 +16,11 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
-    CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, InvalidateRect,
-    LineTo, MoveToEx, ScreenToClient, SelectObject, SetBkMode, SetTextColor, DEFAULT_CHARSET,
-    DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_WORDBREAK, FW_NORMAL, HDC,
-    PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
+    CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
+    InvalidateRect, LineTo, MonitorFromPoint, MoveToEx, ScreenToClient, SelectObject, SetBkMode,
+    SetTextColor, DEFAULT_CHARSET, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
+    DT_WORDBREAK, FW_NORMAL, HDC, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, PS_SOLID,
+    SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
@@ -165,8 +166,7 @@ pub fn run() -> io::Result<()> {
         let _ = AdjustWindowRect(&mut wr, style, false);
         let win_w = wr.right - wr.left;
         let win_h = wr.bottom - wr.top;
-        let x = ((GetSystemMetrics(SM_CXSCREEN) - win_w) / 2).max(0);
-        let y = ((GetSystemMetrics(SM_CYSCREEN) - win_h) / 2).max(0);
+        let (x, y) = calibration_window_origin(win_w, win_h);
 
         let hwnd = CreateWindowExW(
             Default::default(),
@@ -253,6 +253,41 @@ pub fn run() -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn calibration_window_origin(win_w: i32, win_h: i32) -> (i32, i32) {
+    unsafe { origin_on_cursor_work_area(win_w, win_h) }.unwrap_or_else(|| {
+        let x = ((unsafe { GetSystemMetrics(SM_CXSCREEN) } - win_w) / 2).max(0);
+        let y = ((unsafe { GetSystemMetrics(SM_CYSCREEN) } - win_h) / 2).max(0);
+        (x, y)
+    })
+}
+
+unsafe fn origin_on_cursor_work_area(win_w: i32, win_h: i32) -> Option<(i32, i32)> {
+    let mut pt = POINT::default();
+    GetCursorPos(&mut pt).ok()?;
+    let monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    if monitor.0.is_null() {
+        return None;
+    }
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+        return None;
+    }
+    let work = info.rcWork;
+    let work_w = work.right - work.left;
+    let work_h = work.bottom - work.top;
+    if work_w <= 0 || work_h <= 0 {
+        return None;
+    }
+    let mut x = work.left + (work_w - win_w) / 2;
+    let mut y = work.top + (work_h - win_h) / 2;
+    x = x.clamp(work.left, (work.right - win_w).max(work.left));
+    y = y.clamp(work.top, (work.bottom - win_h).max(work.top));
+    Some((x, y))
 }
 
 fn create_button(
