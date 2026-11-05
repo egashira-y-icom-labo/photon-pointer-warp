@@ -10,6 +10,11 @@ use crate::domain::calibration::{
 };
 use crate::domain::circle::DetectorConfig;
 use crate::domain::config::AppConfig;
+use crate::domain::language::Language;
+use crate::platform::i18n::{
+    self, calibrate_cancel, calibrate_reset, calibrate_save,
+};
+use crate::platform::misc::get_system_ui_language;
 use windows::core::w;
 use windows::Win32::Foundation::{
     CloseHandle, COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
@@ -18,9 +23,9 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
     InvalidateRect, LineTo, MonitorFromPoint, MoveToEx, ScreenToClient, SelectObject, SetBkMode,
-    SetTextColor, DEFAULT_CHARSET, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
-    DT_WORDBREAK, FW_NORMAL, HDC, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, PS_SOLID,
-    SRCCOPY, TRANSPARENT,
+    SetTextColor, DEFAULT_CHARSET, DT_CENTER,
+    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_WORDBREAK, FW_NORMAL, HDC, HFONT,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
@@ -35,10 +40,12 @@ use windows::Win32::UI::Input::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetClientRect, GetCursorPos, GetMessageW, GetSystemMetrics, KillTimer, LoadCursorW,
-    PostQuitMessage, RegisterClassW, SetTimer, ShowWindow, TranslateMessage, CS_HREDRAW, CS_OWNDC,
-    CS_VREDRAW, HMENU, IDC_ARROW, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WM_ERASEBKGND, WM_INPUT, WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WNDCLASSW, WS_CAPTION,
-    WS_CHILD, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    PostQuitMessage, RegisterClassW, SendMessageW, SetTimer, ShowWindow, TranslateMessage,
+    BS_CENTER, BS_PUSHBUTTON, BS_VCENTER, CS_HREDRAW, CS_OWNDC, CS_VREDRAW, HMENU, IDC_ARROW, MSG,
+    SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WM_INPUT,
+    WM_MOUSEMOVE, WM_NCDESTROY, WM_PAINT, WM_SETFONT, WM_TIMER, WNDCLASSW, WINDOW_STYLE, WS_CAPTION,
+    WS_CHILD,
+    WS_CLIPCHILDREN, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
 pub const CALIBRATE_MUTEX_NAME: windows::core::PCWSTR = w!("Local\\PhotonPointerWarp.Calibrating");
@@ -52,6 +59,10 @@ const TIMER_MS: u32 = 50;
 const IDC_RESET: i32 = 101;
 const IDC_SAVE: i32 = 102;
 const IDC_CANCEL: i32 = 103;
+const BUTTON_W: i32 = 140;
+const BUTTON_H: i32 = 32;
+const BUTTON_TOP: i32 = CLIENT_H - 52;
+const BUTTON_FONT_PX: i32 = 16;
 const RECENT_LIST: usize = 5;
 
 const COLOR_BG: (u8, u8, u8) = (30, 30, 30);
@@ -99,6 +110,8 @@ struct CalibrateState {
     recommend_error: Option<&'static str>,
     save_hwnd: HWND,
     gate: CalibrateGate,
+    language: Language,
+    button_font: HFONT,
 }
 
 impl CalibrateState {
@@ -156,7 +169,7 @@ pub fn run() -> io::Result<()> {
         };
         RegisterClassW(&wc);
 
-        let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+        let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
         let mut wr = RECT {
             left: 0,
             top: 0,
@@ -184,42 +197,42 @@ pub fn run() -> io::Result<()> {
         )
         .map_err(|e| io::Error::other(format!("CreateWindowExW: {e}")))?;
 
-        let btn_y = CLIENT_H - 52;
-        let btn_h = 32;
+        let btn_y = BUTTON_TOP;
         let gap = 10;
-        let btn_w = 140;
-        let total_w = btn_w * 3 + gap * 2;
+        let total_w = BUTTON_W * 3 + gap * 2;
         let btn_x0 = (CLIENT_W - total_w) / 2;
+        let button_font = create_button_font();
 
+        let language = Language::resolve(
+            AppConfig::load_or_default().language,
+            get_system_ui_language(),
+        );
         create_button(
             instance,
             hwnd,
             IDC_RESET,
-            "やり直す (Reset)",
+            calibrate_reset(language),
             btn_x0,
             btn_y,
-            btn_w,
-            btn_h,
+            button_font,
         )?;
         let save_hwnd = create_button(
             instance,
             hwnd,
             IDC_SAVE,
-            "適用して保存 (Save)",
-            btn_x0 + btn_w + gap,
+            calibrate_save(language),
+            btn_x0 + BUTTON_W + gap,
             btn_y,
-            btn_w,
-            btn_h,
+            button_font,
         )?;
         create_button(
             instance,
             hwnd,
             IDC_CANCEL,
-            "閉じる (Close)",
-            btn_x0 + (btn_w + gap) * 2,
+            calibrate_cancel(language),
+            btn_x0 + (BUTTON_W + gap) * 2,
             btn_y,
-            btn_w,
-            btn_h,
+            button_font,
         )?;
         let _ = EnableWindow(save_hwnd, false);
 
@@ -235,6 +248,8 @@ pub fn run() -> io::Result<()> {
                 recommend_error: None,
                 save_hwnd,
                 gate: CalibrateGate::new(),
+                language,
+                button_font,
             })
         });
 
@@ -290,6 +305,27 @@ unsafe fn origin_on_cursor_work_area(win_w: i32, win_h: i32) -> Option<(i32, i32
     Some((x, y))
 }
 
+fn create_button_font() -> HFONT {
+    unsafe {
+        CreateFontW(
+            BUTTON_FONT_PX,
+            0,
+            0,
+            0,
+            FW_NORMAL.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            0,
+            0,
+            0,
+            0,
+            w!("Segoe UI"),
+        )
+    }
+}
+
 fn create_button(
     instance: HINSTANCE,
     parent: HWND,
@@ -297,26 +333,32 @@ fn create_button(
     label: &str,
     x: i32,
     y: i32,
-    w: i32,
-    h: i32,
+    font: HFONT,
 ) -> io::Result<HWND> {
     let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
-        CreateWindowExW(
+        let hwnd = CreateWindowExW(
             Default::default(),
             w!("BUTTON"),
             windows::core::PCWSTR(wide.as_ptr()),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            WS_CHILD
+                | WS_VISIBLE
+                | WS_TABSTOP
+                | WINDOW_STYLE((BS_PUSHBUTTON | BS_CENTER | BS_VCENTER) as u32),
             x,
             y,
-            w,
-            h,
+            BUTTON_W,
+            BUTTON_H,
             parent,
             HMENU(id as *mut core::ffi::c_void),
             instance,
             None,
         )
-        .map_err(|e| io::Error::other(format!("CreateWindowExW BUTTON: {e}")))
+        .map_err(|e| io::Error::other(format!("CreateWindowExW BUTTON: {e}")))?;
+        if !font.0.is_null() {
+            let _ = SendMessageW(hwnd, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        }
+        Ok(hwnd)
     }
 }
 
@@ -367,7 +409,7 @@ unsafe extern "system" fn wnd_proc(
                         g.reset();
                         let _ = EnableWindow(g.save_hwnd, false);
                     }
-                    let _ = InvalidateRect(hwnd, None, false);
+                    invalidate_content(hwnd);
                 }
                 IDC_SAVE => {
                     try_save_and_close(hwnd);
@@ -387,6 +429,14 @@ unsafe extern "system" fn wnd_proc(
             let _ = KillTimer(hwnd, TIMER_ID);
             PostQuitMessage(0);
             LRESULT(0)
+        }
+        WM_NCDESTROY => {
+            if let Some(state) = STATE.get().and_then(|s| s.lock().ok()) {
+                if !state.button_font.0.is_null() {
+                    let _ = DeleteObject(state.button_font);
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
@@ -478,7 +528,7 @@ fn apply_gate(hwnd: HWND, motion: Option<(f32, f32)>) {
         drop(guard);
         if dirty {
             unsafe {
-                let _ = InvalidateRect(hwnd, None, false);
+                invalidate_content(hwnd);
             }
         }
         return;
@@ -529,7 +579,7 @@ fn apply_gate(hwnd: HWND, motion: Option<(f32, f32)>) {
             drop(guard);
             unsafe {
                 let _ = EnableWindow(save_hwnd, can_save);
-                let _ = InvalidateRect(hwnd, None, false);
+                invalidate_content(hwnd);
             }
             return;
         }
@@ -537,9 +587,19 @@ fn apply_gate(hwnd: HWND, motion: Option<(f32, f32)>) {
     drop(guard);
     if dirty {
         unsafe {
-            let _ = InvalidateRect(hwnd, None, false);
+            invalidate_content(hwnd);
         }
     }
+}
+
+unsafe fn invalidate_content(hwnd: HWND) {
+    let mut client = RECT::default();
+    if GetClientRect(hwnd, &mut client).is_err() {
+        let _ = InvalidateRect(hwnd, None, false);
+        return;
+    }
+    client.bottom = BUTTON_TOP.min(client.bottom);
+    let _ = InvalidateRect(hwnd, Some(&client), false);
 }
 
 fn try_save_and_close(hwnd: HWND) {
@@ -645,7 +705,7 @@ unsafe fn paint_contents(hdc: HDC, state: &CalibrateState, client_w: i32) {
         14,
         client_w - 40,
         52,
-        "キャンバス内で止まって枠がシアンになったら、普段の感覚で回してください",
+        i18n::calibrate_guide(state.language),
         true,
     );
 
@@ -682,7 +742,7 @@ unsafe fn paint_contents(hdc: HDC, state: &CalibrateState, client_w: i32) {
             canvas.top + 10,
             CANVAS_SIZE - 16,
             40,
-            "Ready: 自由な場所・向きで回してください",
+            i18n::calibrate_ready(state.language),
             true,
         );
     }
@@ -709,10 +769,7 @@ unsafe fn paint_contents(hdc: HDC, state: &CalibrateState, client_w: i32) {
         list_top,
         client_w - 48,
         22,
-        &format!(
-            "Samples: {} 回記録済み（納得いくまで回せます）",
-            state.accepted.len()
-        ),
+        &i18n::calibrate_samples(state.language, state.accepted.len()),
         false,
     );
     SetTextColor(hdc, rgb(COLOR_DIM));
@@ -737,29 +794,20 @@ unsafe fn paint_contents(hdc: HDC, state: &CalibrateState, client_w: i32) {
     let rec_top = CLIENT_H - 108;
     SetTextColor(hdc, rgb(COLOR_TEXT));
     let rec = if let Some(cfg) = &state.recommended {
-        format!(
-            "推奨設定: 窓 {}ms / 角 {:.0}° / 楕円比 {:.1}",
-            cfg.window_ms, cfg.min_total_angle_deg, cfg.ellipse_major_over_minor_max
+        i18n::calibrate_suggested(
+            state.language,
+            cfg.window_ms,
+            cfg.min_total_angle_deg,
+            cfg.ellipse_major_over_minor_max,
         )
     } else if let Some(err) = state.recommend_error {
-        format!("推奨を出せません: {}", recommend_error_ja(err))
+        i18n::calibrate_suggest_failed(state.language, err)
     } else if state.accepted.len() < 3 {
-        "推奨設定: 3 回以上描くとここに表示されます".to_string()
+        i18n::calibrate_suggest_need_more(state.language).to_string()
     } else {
-        "推奨設定: 算出中".to_string()
+        i18n::calibrate_suggest_calculating(state.language).to_string()
     };
     draw_text(hdc, 24, rec_top, client_w - 48, 36, &rec, false);
-}
-
-fn recommend_error_ja(reason: &str) -> &'static str {
-    match reason {
-        "mixed_direction" => "回転方向が混在しています",
-        "variance_too_high" => "ばらつきが大きすぎます。やり直してください",
-        "too_few_after_outliers" => "有効なサンプルが不足しています",
-        "too_few_strokes" => "サンプルが不足しています",
-        "too_many_strokes" => "サンプルが多すぎます",
-        _ => "条件を満たしません",
-    }
 }
 
 unsafe fn stroke_polyline_from_origin(
@@ -839,4 +887,48 @@ unsafe fn draw_text(hdc: HDC, x: i32, y: i32, w: i32, h: i32, text: &str, center
         DT_LEFT | DT_SINGLELINE
     };
     DrawTextW(hdc, &mut wide, &mut rc, flags);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::SIZE;
+    use windows::Win32::Graphics::Gdi::{GetDC, GetTextExtentPoint32W, ReleaseDC};
+
+    const TEXT_MARGIN_X: i32 = 12;
+    const TEXT_MARGIN_Y: i32 = 4;
+
+    #[test]
+    fn button_labels_fit_centered_in_both_languages() {
+        unsafe {
+            let font = create_button_font();
+            assert!(!font.0.is_null());
+            let screen = HWND(std::ptr::null_mut());
+            let dc = GetDC(screen);
+            assert!(!dc.0.is_null());
+            let old = SelectObject(dc, font);
+            for language in [Language::Ja, Language::En] {
+                for label in [
+                    calibrate_reset(language),
+                    calibrate_save(language),
+                    calibrate_cancel(language),
+                ] {
+                    let wide: Vec<u16> = label.encode_utf16().collect();
+                    let mut size = SIZE::default();
+                    GetTextExtentPoint32W(dc, &wide, &mut size).expect(label);
+                    let max_w = BUTTON_W - TEXT_MARGIN_X * 2;
+                    let max_h = BUTTON_H - TEXT_MARGIN_Y * 2;
+                    assert!(
+                        size.cx <= max_w && size.cy <= max_h,
+                        "{label} is {}x{}, limit is {max_w}x{max_h}",
+                        size.cx,
+                        size.cy
+                    );
+                }
+            }
+            SelectObject(dc, old);
+            let _ = DeleteObject(font);
+            let _ = ReleaseDC(screen, dc);
+        }
+    }
 }

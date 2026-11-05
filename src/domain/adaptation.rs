@@ -62,8 +62,18 @@ pub enum FeedbackEvent {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfigSuggestion {
     pub new_config: DetectorConfig,
-    /// 実際に変動した差分のみ（例: `"窓 +40ms / 角 -10°"`）
-    pub summary: String,
+    /// 表示言語に依存しない差分。文言は辞書が組み立てる。
+    pub diffs: Vec<SuggestionDiff>,
+}
+
+/// 感度提案で実際に動いた項目。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SuggestionDiff {
+    WindowMs(i32),
+    AngleDeg(i32),
+    RelaxClosure(f32),
+    ThumbPartialClosure,
+    Eccentricity(f32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,10 +260,10 @@ pub fn generate_suggestion(
         apply_fp_adjustment(&mut next);
     }
 
-    let summary = diff_summary(current, &next)?;
+    let diffs = suggestion_diffs(current, &next)?;
     Some(ConfigSuggestion {
         new_config: next,
-        summary,
+        diffs,
     })
 }
 
@@ -377,12 +387,12 @@ fn step_window(current: u64, delta: i64) -> u64 {
     next.clamp(WINDOW_MIN_MS, WINDOW_MAX_MS)
 }
 
-fn diff_summary(before: &DetectorConfig, after: &DetectorConfig) -> Option<String> {
-    let mut parts: Vec<String> = Vec::new();
+fn suggestion_diffs(before: &DetectorConfig, after: &DetectorConfig) -> Option<Vec<SuggestionDiff>> {
+    let mut diffs = Vec::new();
 
     let dw = after.window_ms as i64 - before.window_ms as i64;
     if dw != 0 {
-        parts.push(format!("窓 {dw:+}ms"));
+        diffs.push(SuggestionDiff::WindowMs(dw.clamp(i32::MIN as i64, i32::MAX as i64) as i32));
     }
 
     let d_total = after.min_total_angle_deg - before.min_total_angle_deg;
@@ -393,25 +403,25 @@ fn diff_summary(before: &DetectorConfig, after: &DetectorConfig) -> Option<Strin
         } else {
             d_net
         };
-        parts.push(format!("角 {:+.0}°", shown));
+        diffs.push(SuggestionDiff::AngleDeg(shown.round() as i32));
     }
 
     let d_close = after.closure_rms_factor - before.closure_rms_factor;
     if d_close.abs() >= 0.001 {
-        parts.push(format!("閉合緩和 {d_close:+.2}"));
+        diffs.push(SuggestionDiff::RelaxClosure(d_close));
     } else if after.allow_thumb_partial_closure && !before.allow_thumb_partial_closure {
-        parts.push("親指部分閉合".to_string());
+        diffs.push(SuggestionDiff::ThumbPartialClosure);
     }
 
     let d_aspect = after.ellipse_major_over_minor_max - before.ellipse_major_over_minor_max;
     if d_aspect.abs() >= 0.01 {
-        parts.push(format!("楕円 {d_aspect:+.1}"));
+        diffs.push(SuggestionDiff::Eccentricity(d_aspect));
     }
 
-    if parts.is_empty() {
+    if diffs.is_empty() {
         None
     } else {
-        Some(parts.join(" / "))
+        Some(diffs)
     }
 }
 
@@ -476,7 +486,7 @@ mod tests {
             generate_suggestion(&cfg, &n_missed(2, MissedCause::AngleDeficit)).expect("suggest");
         assert_eq!(suggestion.new_config.min_total_angle_deg, 220.0);
         assert_eq!(suggestion.new_config.min_net_angle_deg, 190.0);
-        assert_eq!(suggestion.summary, "角 -10°");
+        assert_eq!(suggestion.diffs, vec![SuggestionDiff::AngleDeg(-10)]);
         assert_eq!(suggestion.new_config.window_ms, cfg.window_ms);
     }
 
@@ -488,7 +498,7 @@ mod tests {
         let suggestion =
             generate_suggestion(&cfg, &n_missed(2, MissedCause::NotClosed)).expect("suggest");
         assert!((suggestion.new_config.closure_rms_factor - 0.55).abs() < 1e-5);
-        assert_eq!(suggestion.summary, "閉合緩和 +0.05");
+        assert!(matches!(suggestion.diffs.as_slice(), [SuggestionDiff::RelaxClosure(v)] if (*v - 0.05).abs() < 1e-4));
     }
 
     #[test]
@@ -497,7 +507,7 @@ mod tests {
         let suggestion =
             generate_suggestion(&cfg, &n_missed(2, MissedCause::TimeExceeded)).expect("suggest");
         assert_eq!(suggestion.new_config.window_ms, 590);
-        assert_eq!(suggestion.summary, "窓 +40ms");
+        assert_eq!(suggestion.diffs, vec![SuggestionDiff::WindowMs(40)]);
     }
 
     #[test]
@@ -505,7 +515,7 @@ mod tests {
         let cfg = DetectorConfig::default();
         let suggestion = generate_suggestion(&cfg, &n_accidental(2)).expect("suggest");
         assert_eq!(suggestion.new_config.min_total_angle_deg, 240.0);
-        assert_eq!(suggestion.summary, "角 +10°");
+        assert_eq!(suggestion.diffs, vec![SuggestionDiff::AngleDeg(10)]);
         assert_eq!(suggestion.new_config.window_ms, cfg.window_ms);
     }
 

@@ -3,6 +3,7 @@ pub mod calibration;
 pub mod hud_hit;
 pub mod circle;
 pub mod config;
+pub mod language;
 pub mod monitor_layout;
 pub mod settle;
 pub mod shake;

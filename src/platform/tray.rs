@@ -3,6 +3,13 @@
 use std::io;
 use std::mem::size_of;
 
+use crate::domain::adaptation::SuggestionDiff;
+use crate::domain::language::{Language, LanguageConfig};
+use crate::platform::i18n::{
+    self, badge_apply, badge_dismiss, menu_calibrate, menu_dismiss_suggestion, menu_exit,
+    menu_language, menu_language_auto, menu_language_en, menu_language_ja, menu_pause,
+    menu_show_background, menu_startup, tip_active, tip_paused, tip_suggest,
+};
 use crate::platform::icon::{
     nearest_tray_edge, signature_image, tray_bgra, xor_and_masks, TrayGlyph,
 };
@@ -16,7 +23,8 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIcon, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos,
     GetSystemMetrics, PostMessageW, SetForegroundWindow, TrackPopupMenuEx, HICON, MF_CHECKED,
-    MF_SEPARATOR, MF_STRING, MF_UNCHECKED, SM_CXSMICON, TPM_BOTTOMALIGN, TPM_NONOTIFY,
+    MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, SM_CXSMICON, TPM_BOTTOMALIGN,
+    TPM_NONOTIFY,
     TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, WM_APP, WM_LBUTTONDBLCLK, WM_NULL,
     WM_RBUTTONUP,
 };
@@ -31,10 +39,9 @@ pub const IDM_APPLY_SUGGESTION: usize = 4004;
 pub const IDM_DISMISS_SUGGESTION: usize = 4005;
 pub const IDM_STARTUP: usize = 4006;
 pub const IDM_TOGGLE_THUMBNAIL: usize = 4007;
-
-const TIP_ACTIVE: &str = "Photon Pointer Warp";
-const TIP_PAUSED: &str = "Photon Pointer Warp (一時停止中)";
-const TIP_SUGGEST: &str = "Photon Pointer Warp (感度微調整の提案あり)";
+pub const IDM_LANG_AUTO: usize = 4008;
+pub const IDM_LANG_EN: usize = 4009;
+pub const IDM_LANG_JA: usize = 4010;
 
 pub struct TrayIcon {
     hwnd: HWND,
@@ -45,13 +52,14 @@ pub struct TrayIcon {
     icon_suggest: HICON,
     paused: bool,
     suggest_pending: bool,
+    language: Language,
 }
 
 // HICON / HWND はメッセージスレッドのみ
 unsafe impl Send for TrayIcon {}
 
 impl TrayIcon {
-    pub unsafe fn add(hwnd: HWND, instance: HINSTANCE) -> io::Result<Self> {
+    pub unsafe fn add(hwnd: HWND, instance: HINSTANCE, language: Language) -> io::Result<Self> {
         let icon_px = current_small_icon_px();
         let (icon_active, icon_paused, icon_suggest) = create_state_icons(instance, icon_px)?;
         let tray = Self {
@@ -63,6 +71,7 @@ impl TrayIcon {
             icon_suggest,
             paused: false,
             suggest_pending: false,
+            language,
         };
         let nid = tray.nid();
         if !Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
@@ -123,6 +132,15 @@ impl TrayIcon {
         let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
 
+    pub unsafe fn set_language(&mut self, language: Language) {
+        if self.language == language {
+            return;
+        }
+        self.language = language;
+        let nid = self.nid();
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+
     pub unsafe fn set_suggest_pending(&mut self, pending: bool) {
         if self.suggest_pending == pending {
             return;
@@ -142,7 +160,9 @@ impl TrayIcon {
         hwnd: HWND,
         paused: bool,
         thumbnail_enabled: bool,
-        suggestion: Option<&str>,
+        suggestion: Option<&[SuggestionDiff]>,
+        language: Language,
+        language_config: LanguageConfig,
         kind: PopupMenu,
         anchor: Option<PopupAnchor>,
     ) -> u32 {
@@ -164,8 +184,8 @@ impl TrayIcon {
             return 0;
         };
         if kind == PopupMenu::SuggestionOnly {
-            let apply_label = utf16_z("感度の微調整を適用");
-            let dismiss_label = utf16_z("今回は見送る");
+            let apply_label = utf16_z(badge_apply(language));
+            let dismiss_label = utf16_z(badge_dismiss(language));
             let _ = AppendMenuW(
                 menu,
                 MF_STRING,
@@ -179,7 +199,14 @@ impl TrayIcon {
                 PCWSTR(dismiss_label.as_ptr()),
             );
         } else {
-            append_full_menu(menu, paused, thumbnail_enabled, suggestion);
+            append_full_menu(
+                menu,
+                paused,
+                thumbnail_enabled,
+                suggestion,
+                language,
+                language_config,
+            );
         }
 
         let _ = SetForegroundWindow(hwnd);
@@ -215,11 +242,11 @@ impl TrayIcon {
         copy_tip(
             &mut nid.szTip,
             if self.paused {
-                TIP_PAUSED
+                tip_paused(self.language)
             } else if self.suggest_pending {
-                TIP_SUGGEST
+                tip_suggest(self.language)
             } else {
-                TIP_ACTIVE
+                tip_active()
             },
         );
         nid
@@ -260,12 +287,14 @@ unsafe fn append_full_menu(
     menu: windows::Win32::UI::WindowsAndMessaging::HMENU,
     paused: bool,
     thumbnail_enabled: bool,
-    suggestion: Option<&str>,
+    suggestion: Option<&[SuggestionDiff]>,
+    language: Language,
+    language_config: LanguageConfig,
 ) {
-    let apply_label;
-    if let Some(summary) = suggestion {
-        apply_label = utf16_z(&format!("★ 感度の微調整を適用: {summary}"));
-        let dismiss_label = utf16_z("提案を見送る");
+    if let Some(diffs) = suggestion {
+        let diff = i18n::format_diffs(language, diffs);
+        let apply_label = utf16_z(&i18n::menu_apply_with_diff(language, &diff));
+        let dismiss_label = utf16_z(menu_dismiss_suggestion(language));
         let _ = AppendMenuW(
             menu,
             MF_STRING,
@@ -280,37 +309,88 @@ unsafe fn append_full_menu(
         );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, w!(""));
     }
-    let _ = AppendMenuW(
-        menu,
-        MF_STRING,
-        IDM_CALIBRATE,
-        w!("設定 / キャリブレーション..."),
-    );
+    append_labeled(menu, MF_STRING, IDM_CALIBRATE, menu_calibrate(language));
     let startup_flags = if startup::is_startup_enabled() {
         MF_STRING | MF_CHECKED
     } else {
         MF_STRING | MF_UNCHECKED
     };
-    let _ = AppendMenuW(menu, startup_flags, IDM_STARTUP, w!("Windows 起動時に実行"));
+    append_labeled(menu, startup_flags, IDM_STARTUP, menu_startup(language));
     let thumbnail_flags = if thumbnail_enabled {
         MF_STRING | MF_CHECKED
     } else {
         MF_STRING | MF_UNCHECKED
     };
-    let _ = AppendMenuW(
+    append_labeled(
         menu,
         thumbnail_flags,
         IDM_TOGGLE_THUMBNAIL,
-        w!("デスクトップ背景表示"),
+        menu_show_background(language),
     );
     let pause_flags = if paused {
         MF_STRING | MF_CHECKED
     } else {
         MF_STRING | MF_UNCHECKED
     };
-    let _ = AppendMenuW(menu, pause_flags, IDM_PAUSE, w!("サークル検知を一時停止"));
+    append_labeled(menu, pause_flags, IDM_PAUSE, menu_pause(language));
+    append_language_submenu(menu, language_config);
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, w!(""));
-    let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT, w!("終了"));
+    append_labeled(menu, MF_STRING, IDM_EXIT, menu_exit(language));
+}
+
+unsafe fn append_language_submenu(
+    menu: windows::Win32::UI::WindowsAndMessaging::HMENU,
+    current: LanguageConfig,
+) {
+    let Ok(submenu) = CreatePopupMenu() else {
+        return;
+    };
+    append_labeled(
+        submenu,
+        language_item_flags(current, LanguageConfig::Auto),
+        IDM_LANG_AUTO,
+        menu_language_auto(),
+    );
+    append_labeled(
+        submenu,
+        language_item_flags(current, LanguageConfig::En),
+        IDM_LANG_EN,
+        menu_language_en(),
+    );
+    append_labeled(
+        submenu,
+        language_item_flags(current, LanguageConfig::Ja),
+        IDM_LANG_JA,
+        menu_language_ja(),
+    );
+    let title = utf16_z(menu_language());
+    let _ = AppendMenuW(
+        menu,
+        MF_STRING | MF_POPUP,
+        submenu.0 as usize,
+        PCWSTR(title.as_ptr()),
+    );
+}
+
+fn language_item_flags(
+    current: LanguageConfig,
+    item: LanguageConfig,
+) -> windows::Win32::UI::WindowsAndMessaging::MENU_ITEM_FLAGS {
+    if current == item {
+        MF_STRING | MF_CHECKED
+    } else {
+        MF_STRING | MF_UNCHECKED
+    }
+}
+
+unsafe fn append_labeled(
+    menu: windows::Win32::UI::WindowsAndMessaging::HMENU,
+    flags: windows::Win32::UI::WindowsAndMessaging::MENU_ITEM_FLAGS,
+    id: usize,
+    label: &str,
+) {
+    let wide = utf16_z(label);
+    let _ = AppendMenuW(menu, flags, id, PCWSTR(wide.as_ptr()));
 }
 
 fn copy_tip(dst: &mut [u16; 128], text: &str) {

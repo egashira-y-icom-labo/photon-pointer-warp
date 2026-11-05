@@ -12,6 +12,7 @@ use photon_pointer_warp::domain::adaptation::{
     extract_best_near_miss, generate_suggestion, is_accidental_trigger, ConfigSuggestion,
     FeedbackEvent, HudCloseReason,
 };
+use photon_pointer_warp::domain::language::{Language, LanguageConfig};
 use photon_pointer_warp::domain::calibration::{analyze_relative_stroke, StrokeMetrics};
 use photon_pointer_warp::domain::circle::{CircleDetector, GestureWindowStats, MotionSample};
 use photon_pointer_warp::domain::config::{
@@ -25,12 +26,15 @@ use photon_pointer_warp::domain::tracking::{TrackingAction, TrackingController};
 use photon_pointer_warp::domain::trigger::{TriggerCoordinator, TriggerSource};
 use photon_pointer_warp::platform::calibrate_window::CALIBRATE_MUTEX_NAME;
 use photon_pointer_warp::platform::capture::{capture_thumbnails, ThumbnailLayer};
+use photon_pointer_warp::platform::i18n;
 use photon_pointer_warp::platform::layout::{warp_target_for_cell, MINIMAP_GRID};
+use photon_pointer_warp::platform::misc::get_system_ui_language;
 use photon_pointer_warp::platform::monitors::{capture_display_snapshot, DisplaySnapshot};
 use photon_pointer_warp::platform::startup;
 use photon_pointer_warp::platform::tray::{
     PopupAnchor, PopupMenu, TrayEvent, TrayIcon, IDM_APPLY_SUGGESTION, IDM_CALIBRATE,
-    IDM_DISMISS_SUGGESTION, IDM_EXIT, IDM_PAUSE, IDM_STARTUP, IDM_TOGGLE_THUMBNAIL, WM_TRAYICON,
+    IDM_DISMISS_SUGGESTION, IDM_EXIT, IDM_LANG_AUTO, IDM_LANG_EN, IDM_LANG_JA, IDM_PAUSE,
+    IDM_STARTUP, IDM_TOGGLE_THUMBNAIL, WM_TRAYICON,
 };
 use photon_pointer_warp::platform::window::HudOverlay;
 use windows::core::w;
@@ -168,6 +172,8 @@ struct AppState {
     last_trigger_metrics: Option<StrokeMetrics>,
     feedback_events: VecDeque<FeedbackEvent>,
     pending_suggestion: Option<ConfigSuggestion>,
+    language_config: LanguageConfig,
+    language: Language,
     hud_opened_at: Option<Instant>,
     hud_opened_cursor: Option<(i32, i32)>,
     feedback_circle_hud: bool,
@@ -356,8 +362,9 @@ pub fn run(config: AppConfig) -> io::Result<()> {
             effective_hud_style(config.hud_style, display.monitors.len()).as_str(),
             display.monitors.len()
         );
-        let tray =
-            TrayIcon::add(hwnd, instance).map_err(|e| io::Error::other(format!("tray: {e}")))?;
+        let language = Language::resolve(config.language, get_system_ui_language());
+        let tray = TrayIcon::add(hwnd, instance, language)
+            .map_err(|e| io::Error::other(format!("tray: {e}")))?;
         let (thumbnail_tx, thumbnail_rx) = mpsc::channel();
 
         APP.get_or_init(|| {
@@ -393,6 +400,8 @@ pub fn run(config: AppConfig) -> io::Result<()> {
                 last_trigger_metrics: None,
                 feedback_events: VecDeque::new(),
                 pending_suggestion: None,
+                language_config: config.language,
+                language,
                 hud_opened_at: None,
                 hud_opened_cursor: None,
                 feedback_circle_hud: false,
@@ -576,6 +585,12 @@ fn reload_detector_from_disk(state: &mut AppState) {
             eprintln!("[thumb] background reconfigure: {err}");
         }
     }
+    let language = Language::resolve(cfg.language, get_system_ui_language());
+    state.language_config = cfg.language;
+    state.language = language;
+    if let Some(tray) = state.tray.as_mut() {
+        unsafe { tray.set_language(language) };
+    }
     cancel_settling(state);
     state.config_mtime = config_file_mtime();
 }
@@ -730,11 +745,15 @@ fn open_posted_menu() {
             guard.detection_paused,
             guard.hud_background == HudBackground::Thumbnail,
             tray.hwnd(),
-            guard.pending_suggestion.as_ref().map(|s| s.summary.clone()),
+            guard.pending_suggestion.as_ref().map(|s| s.diffs.clone()),
+            guard.language,
+            guard.language_config,
             posted,
         ))
     };
-    let Some((paused, thumbnail_enabled, hwnd, suggestion, posted)) = prepared else {
+    let Some((paused, thumbnail_enabled, hwnd, suggestion, language, language_config, posted)) =
+        prepared
+    else {
         return;
     };
     let (kind, anchor) = match posted {
@@ -762,6 +781,8 @@ fn open_posted_menu() {
             paused,
             thumbnail_enabled,
             suggestion.as_deref(),
+            language,
+            language_config,
             kind,
             anchor,
         )
@@ -859,7 +880,7 @@ fn poll_config_and_calibrate_child() {
 fn handle_tray_callback(lparam: LPARAM) {
     match TrayIcon::callback_event(lparam) {
         Some(TrayEvent::ContextMenu) => {
-            let (paused, thumbnail_enabled, hwnd, suggestion) = {
+            let (paused, thumbnail_enabled, hwnd, suggestion, language, language_config) = {
                 let guard = match APP.get().and_then(|a| a.try_lock().ok()) {
                     Some(g) => g,
                     None => return,
@@ -871,7 +892,9 @@ fn handle_tray_callback(lparam: LPARAM) {
                     guard.detection_paused,
                     guard.hud_background == HudBackground::Thumbnail,
                     tray.hwnd(),
-                    guard.pending_suggestion.as_ref().map(|s| s.summary.clone()),
+                    guard.pending_suggestion.as_ref().map(|s| s.diffs.clone()),
+                    guard.language,
+                    guard.language_config,
                 )
             };
 
@@ -881,6 +904,8 @@ fn handle_tray_callback(lparam: LPARAM) {
                     paused,
                     thumbnail_enabled,
                     suggestion.as_deref(),
+                    language,
+                    language_config,
                     PopupMenu::Full,
                     None,
                 )
@@ -962,6 +987,28 @@ fn handle_tray_command_sync(hwnd: HWND, id: u32) {
         IDM_EXIT => unsafe {
             let _ = DestroyWindow(hwnd);
         },
+        IDM_LANG_AUTO | IDM_LANG_EN | IDM_LANG_JA => {
+            let selected = match id as usize {
+                IDM_LANG_EN => LanguageConfig::En,
+                IDM_LANG_JA => LanguageConfig::Ja,
+                _ => LanguageConfig::Auto,
+            };
+            if let Some(mut guard) = APP.get().and_then(|a| a.try_lock().ok()) {
+                let language = Language::resolve(selected, get_system_ui_language());
+                guard.language_config = selected;
+                guard.language = language;
+                if let Some(tray) = guard.tray.as_mut() {
+                    unsafe { tray.set_language(language) };
+                }
+                let mut config = AppConfig::load_or_default();
+                config.language = selected;
+                if let Err(err) = config.save() {
+                    eprintln!("[i18n] language save: {err}");
+                } else {
+                    guard.config_mtime = config_file_mtime();
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -1070,7 +1117,7 @@ fn anchor_tracking(guard: &mut AppState) -> io::Result<()> {
     if let Some((x, y)) = cursor_screen_pos() {
         unsafe { guard.hud.move_to(POINT { x, y })? };
     }
-    let hint = guard.pending_suggestion.as_ref().map(|s| s.summary.clone());
+    let hint = guard.pending_suggestion.as_ref().map(|_| "");
     unsafe { guard.hud.anchor(hint.as_deref())? };
     guard.hud_phase = HudPhase::Anchored;
     stop_tracking_timer();
@@ -1182,7 +1229,7 @@ fn open_hud_after_settle(
     let _ = refresh_display_if_stale(guard)?;
     bind_hud_map(guard);
     let message_hwnd = HWND(MESSAGE_HWND.load(Ordering::Acquire) as _);
-    let hint = guard.pending_suggestion.as_ref().map(|s| s.summary.clone());
+    let hint = guard.pending_suggestion.as_ref().map(|_| "");
     let hud_diag = unsafe {
         guard
             .hud
@@ -1451,7 +1498,10 @@ fn refresh_pending_suggestion(state: &mut AppState) {
     state.pending_suggestion = generate_suggestion(state.coordinator.circle.config(), &events);
     sync_tray_suggestion(state);
     if let Some(suggestion) = &state.pending_suggestion {
-        eprintln!("[adapt] suggestion: {}", suggestion.summary);
+        eprintln!(
+            "[adapt] suggestion: {}",
+            i18n::format_diffs(Language::En, &suggestion.diffs)
+        );
         let _ = io::stderr().flush();
     }
 }
@@ -1633,7 +1683,7 @@ fn warp_hud_to_point(target_x: i32, target_y: i32, detail: String) {
     println!("[warp] Jumped to ({target_x}, {target_y}) [{detail}]");
     let _ = io::stdout().flush();
     bind_hud_map(&mut guard);
-    let hint = guard.pending_suggestion.as_ref().map(|s| s.summary.clone());
+    let hint = guard.pending_suggestion.as_ref().map(|_| "");
     if let Err(e) = unsafe { guard.hud.activate_at_cursor(hint.as_deref()) } {
         eprintln!("[hud] Failed to re-activate at landing point: {e}");
         return;

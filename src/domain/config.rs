@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::circle::DetectorConfig;
+use super::language::LanguageConfig;
 
 const CONFIG_VERSION: u32 = 1;
 const APP_DIR_NAME: &str = "photon-pointer-warp";
@@ -99,6 +100,9 @@ pub struct AppConfig {
     pub hud_background: HudBackground,
     #[serde(default = "default_hud_thumbnail_dim")]
     pub hud_thumbnail_dim: f32,
+    /// 省略時は OS の UI 言語。日本語以外は英語。
+    #[serde(default)]
+    pub language: LanguageConfig,
 }
 
 impl Default for AppConfig {
@@ -109,6 +113,7 @@ impl Default for AppConfig {
             hud_style: default_hud_style(),
             hud_background: default_hud_background(),
             hud_thumbnail_dim: default_hud_thumbnail_dim(),
+            language: LanguageConfig::Auto,
         }
     }
 }
@@ -183,6 +188,7 @@ mod tests {
         assert_eq!(parsed.hud_style, HudStyle::Monitors);
         assert_eq!(parsed.hud_background, HudBackground::Thumbnail);
         assert!(parsed.detector.allow_thumb_partial_closure);
+        assert_eq!(parsed.language, LanguageConfig::Auto);
     }
 
     #[test]
