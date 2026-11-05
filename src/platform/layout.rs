@@ -100,8 +100,15 @@ fn gesture_pin_offsets(
 }
 
 /// 3×3 グリッドのピンを、仮想画面上の相対位置としてパネル内に置く。
-pub fn grid_pin_offsets(gesture_x: i32, gesture_y: i32, vs: VirtualScreen) -> (i32, i32) {
-    gesture_pin_offsets(gesture_x, gesture_y, MINIMAP_PANEL_PX, vs)
+/// Y はヘッダーの下のグリッド内。カーソルが画面上端に近いときは、パネルのクランプでピンが下へ寄る。
+pub fn grid_pin_offsets(
+    gesture_x: i32,
+    gesture_y: i32,
+    vs: VirtualScreen,
+    header_height: i32,
+) -> (i32, i32) {
+    let (x, y) = gesture_pin_offsets(gesture_x, gesture_y, MINIMAP_PANEL_PX, vs);
+    (x, y + header_height.max(0))
 }
 
 fn clamp_panel_origin(ideal: i32, origin: i32, span: i32, panel: i32) -> i32 {
@@ -146,15 +153,17 @@ pub fn minimap_anchor_layout(
     gesture_x: i32,
     gesture_y: i32,
     vs: VirtualScreen,
+    header_height: i32,
 ) -> MinimapAnchorLayout {
-    let (pin_offset_x, pin_offset_y) = grid_pin_offsets(gesture_x, gesture_y, vs);
+    let header = header_height.max(0);
+    let (pin_offset_x, pin_offset_y) = grid_pin_offsets(gesture_x, gesture_y, vs, header);
     anchor_panel_within(
         gesture_x,
         gesture_y,
         pin_offset_x,
         pin_offset_y,
         MINIMAP_PANEL_PX,
-        MINIMAP_PANEL_PX,
+        MINIMAP_PANEL_PX + header,
         vs.x,
         vs.y,
         vs.width,
@@ -183,13 +192,16 @@ pub fn minimap_cell_at(
     panel_left: i32,
     panel_top: i32,
     panel_size: i32,
+    header_height: i32,
 ) -> Option<(usize, usize)> {
     if panel_size <= 0 {
         return None;
     }
+    let header = header_height.max(0);
+    let grid_top = panel_top.saturating_add(header);
     let right = panel_left.saturating_add(panel_size);
-    let bottom = panel_top.saturating_add(panel_size);
-    if screen_x < panel_left || screen_y < panel_top || screen_x >= right || screen_y >= bottom {
+    let bottom = grid_top.saturating_add(panel_size);
+    if screen_x < panel_left || screen_y < grid_top || screen_x >= right || screen_y >= bottom {
         return None;
     }
     let cell = panel_size / MINIMAP_GRID as i32;
@@ -197,7 +209,7 @@ pub fn minimap_cell_at(
         return None;
     }
     let col = ((screen_x - panel_left) / cell) as usize;
-    let row = ((screen_y - panel_top) / cell) as usize;
+    let row = ((screen_y - grid_top) / cell) as usize;
     if col >= MINIMAP_GRID || row >= MINIMAP_GRID {
         return None;
     }
@@ -239,7 +251,7 @@ mod tests {
     #[test]
     fn anchor_pin_matches_gesture_at_desktop_center() {
         let vs = vs_1920x1200();
-        let layout = minimap_anchor_layout(960, 600, vs);
+        let layout = minimap_anchor_layout(960, 600, vs, 0);
         assert_eq!(layout.pin_screen_x, 960);
         assert_eq!(layout.pin_screen_y, 600);
         assert_panel_inside_vs(layout, vs);
@@ -248,7 +260,7 @@ mod tests {
     #[test]
     fn anchor_pin_matches_gesture_at_desktop_bottom_left() {
         let vs = vs_1920x1200();
-        let layout = minimap_anchor_layout(96, 1140, vs);
+        let layout = minimap_anchor_layout(96, 1140, vs, 0);
         assert_eq!(layout.pin_screen_x, 96);
         assert_eq!(layout.pin_screen_y, 1140);
         assert_panel_inside_vs(layout, vs);
@@ -258,6 +270,7 @@ mod tests {
             layout.panel_left,
             layout.panel_top,
             MINIMAP_PANEL_PX,
+            0,
         )
         .unwrap();
         assert_eq!(cell, (0, 2));
@@ -266,7 +279,7 @@ mod tests {
     #[test]
     fn anchor_pin_matches_gesture_at_desktop_bottom_right() {
         let vs = vs_1920x1200();
-        let layout = minimap_anchor_layout(1824, 1140, vs);
+        let layout = minimap_anchor_layout(1824, 1140, vs, 0);
         assert_eq!(layout.pin_screen_x, 1824);
         assert_eq!(layout.pin_screen_y, 1140);
         assert_panel_inside_vs(layout, vs);
@@ -276,7 +289,7 @@ mod tests {
     fn anchor_pin_matches_gesture_at_screen_corners() {
         let vs = vs_1920x1200();
         for (gx, gy) in [(0, 0), (1920, 0), (0, 1200), (1920, 1200)] {
-            let layout = minimap_anchor_layout(gx, gy, vs);
+            let layout = minimap_anchor_layout(gx, gy, vs, 0);
             assert_eq!(
                 (layout.pin_screen_x, layout.pin_screen_y),
                 (gx, gy),
@@ -301,10 +314,63 @@ mod tests {
     #[test]
     fn minimap_cell_indexing() {
         let panel = MINIMAP_PANEL_PX;
-        let (c, r) = minimap_cell_at(70, 130, 10, 10, panel).unwrap();
+        let (c, r) = minimap_cell_at(70, 130, 10, 10, panel, 0).unwrap();
         assert_eq!(c, 1);
         assert_eq!(r, 2);
-        assert!(minimap_cell_at(9, 10, 10, 10, panel).is_none());
+        assert!(minimap_cell_at(9, 10, 10, 10, panel, 0).is_none());
+    }
+
+    #[test]
+    fn header_shifts_the_grid_without_moving_the_pin_off_the_cursor() {
+        let vs = vs_1920x1200();
+        let header = 24;
+        let plain = minimap_anchor_layout(960, 600, vs, 0);
+        let headed = minimap_anchor_layout(960, 600, vs, header);
+        assert_eq!((headed.pin_screen_x, headed.pin_screen_y), (960, 600));
+        assert_eq!(headed.panel_left, plain.panel_left);
+        assert_eq!(headed.panel_top, plain.panel_top - header);
+        assert!(headed.panel_top >= vs.y);
+        assert!(headed.panel_top + MINIMAP_PANEL_PX + header <= vs.y + vs.height);
+
+        let cell = minimap_cell_at(
+            headed.pin_screen_x,
+            headed.pin_screen_y,
+            headed.panel_left,
+            headed.panel_top,
+            MINIMAP_PANEL_PX,
+            header,
+        )
+        .unwrap();
+        let plain_cell = minimap_cell_at(
+            plain.pin_screen_x,
+            plain.pin_screen_y,
+            plain.panel_left,
+            plain.panel_top,
+            MINIMAP_PANEL_PX,
+            0,
+        )
+        .unwrap();
+        assert_eq!(cell, plain_cell);
+        assert!(minimap_cell_at(
+            headed.panel_left + 5,
+            headed.panel_top + header - 1,
+            headed.panel_left,
+            headed.panel_top,
+            MINIMAP_PANEL_PX,
+            header,
+        )
+        .is_none());
+        assert_eq!(
+            minimap_cell_at(
+                headed.panel_left + 5,
+                headed.panel_top + header,
+                headed.panel_left,
+                headed.panel_top,
+                MINIMAP_PANEL_PX,
+                header,
+            ),
+            Some((0, 0))
+        );
     }
 
     #[test]

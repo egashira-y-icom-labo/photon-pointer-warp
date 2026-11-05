@@ -12,7 +12,7 @@ use crate::platform::capture::{CaptureRequest, ThumbnailLayer};
 use crate::platform::icon::signature_image;
 use crate::platform::layout::{
     anchor_panel_within, grid_pin_offsets, is_pointer_out_of_bounds, minimap_cell_at,
-    point_within_radius, warp_target_for_cell, PanelScreenRect, VirtualScreen,
+    point_within_radius, PanelScreenRect, VirtualScreen,
     DISMISS_OUT_OF_BOUNDS_MARGIN_PX, MINIMAP_CELL_PX, MINIMAP_GRID, MINIMAP_PANEL_PX,
     ORIGIN_CANCEL_RADIUS_PX,
 };
@@ -377,12 +377,7 @@ impl HudOverlay {
         self.map_generation = self.map_generation.wrapping_add(1);
         self.monitor_hover = None;
         if effective == HudStyle::Grid {
-            self.map_style = HudStyle::Grid;
-            self.geometry = None;
-            self.header_h = 0;
-            self.panel_w = MINIMAP_PANEL_PX;
-            self.panel_h = MINIMAP_PANEL_PX;
-            self.refresh_header_left_rect();
+            self.use_grid_panel();
             return;
         }
         let long_max =
@@ -392,12 +387,7 @@ impl HudOverlay {
         let header = header_height_px(self.dpi);
         let geometry = MinimapGeometry::build(&self.monitors, max_w, max_h, PANEL_PAD_PX, header);
         if geometry.blocks.is_empty() {
-            self.map_style = HudStyle::Grid;
-            self.geometry = None;
-            self.header_h = 0;
-            self.panel_w = MINIMAP_PANEL_PX;
-            self.panel_h = MINIMAP_PANEL_PX;
-            self.refresh_header_left_rect();
+            self.use_grid_panel();
             return;
         }
         self.header_h = header;
@@ -405,6 +395,15 @@ impl HudOverlay {
         self.panel_h = geometry.panel_h;
         self.geometry = Some(geometry);
         self.map_style = HudStyle::Monitors;
+    }
+
+    fn use_grid_panel(&mut self) {
+        self.map_style = HudStyle::Grid;
+        self.geometry = None;
+        self.header_h = header_height_px(self.dpi);
+        self.panel_w = MINIMAP_PANEL_PX;
+        self.panel_h = MINIMAP_PANEL_PX + self.header_h;
+        self.refresh_header_left_rect();
     }
 
     pub fn uses_monitor_map(&self) -> bool {
@@ -518,6 +517,7 @@ impl HudOverlay {
                 },
                 origin_radius: ORIGIN_CANCEL_RADIUS_PX,
                 monitor: self.monitor_landing(screen_x, screen_y),
+                cell: self.grid_cell_index(screen_x, screen_y),
             },
         )
     }
@@ -534,23 +534,26 @@ impl HudOverlay {
     }
 
     fn monitor_landing(&self, screen_x: i32, screen_y: i32) -> Option<(usize, hud_hit::Point)> {
+        if !self.uses_monitor_map() {
+            return None;
+        }
+        let local = self.panel_local(screen_x, screen_y)?;
+        let (index, target) = self.geometry.as_ref()?.hit(local)?;
+        Some((
+            index,
+            hud_hit::Point {
+                x: target.0,
+                y: target.1,
+            },
+        ))
+    }
+
+    fn grid_cell_index(&self, screen_x: i32, screen_y: i32) -> Option<usize> {
         if self.uses_monitor_map() {
-            let local = self.panel_local(screen_x, screen_y)?;
-            let (index, target) = self.geometry.as_ref()?.hit(local)?;
-            return Some((
-                index,
-                hud_hit::Point {
-                    x: target.0,
-                    y: target.1,
-                },
-            ));
+            return None;
         }
         let (col, row) = self.minimap_cell_at_screen(screen_x, screen_y)?;
-        let (x, y) = warp_target_for_cell(col, row, self.virtual_screen);
-        Some((
-            row * MINIMAP_GRID + col,
-            hud_hit::Point { x, y },
-        ))
+        Some(row * MINIMAP_GRID + col)
     }
 
     pub fn screen_in_panel(&self, screen_x: i32, screen_y: i32) -> bool {
@@ -739,7 +742,7 @@ impl HudOverlay {
                 .map(|geo| geo.screen_to_panel((cursor.x, cursor.y)))
                 .unwrap_or((0, 0))
         } else {
-            grid_pin_offsets(cursor.x, cursor.y, self.virtual_screen)
+            grid_pin_offsets(cursor.x, cursor.y, self.virtual_screen, self.header_h)
         };
         let (left, top, width, height) = self.placement_bounds(cursor);
         anchor_panel_within(
@@ -863,6 +866,7 @@ impl HudOverlay {
             self.panel_screen.left,
             self.panel_screen.top,
             MINIMAP_PANEL_PX,
+            self.header_h,
         )
     }
 
@@ -903,9 +907,7 @@ impl HudOverlay {
             _ => None,
         };
         let next_cell = match hit {
-            HudHit::Monitor { index, .. } if !self.uses_monitor_map() => {
-                Some((index % MINIMAP_GRID, index / MINIMAP_GRID))
-            }
+            HudHit::Cell { index } => Some((index % MINIMAP_GRID, index / MINIMAP_GRID)),
             _ => None,
         };
         let hover_changed = if self.uses_monitor_map() {
@@ -951,15 +953,29 @@ impl HudOverlay {
         if self.uses_monitor_map() {
             self.compose_monitor_map()?;
         } else {
-            draw_hud(
+            let header_h = self.header_h;
+            draw_grid(
                 self.pixels,
                 self.virtual_screen.width,
                 self.virtual_screen.height,
                 self.virtual_screen,
-                self.pin_screen,
                 self.panel_screen,
                 self.hover_cell,
+                header_h,
             );
+            if header_h > 0 {
+                paint_header(
+                    self.pixels,
+                    self.virtual_screen.width,
+                    self.virtual_screen.height,
+                    self.panel_screen.left - self.virtual_screen.x,
+                    self.panel_screen.top - self.virtual_screen.y,
+                    self.panel_w,
+                    header_h,
+                    &mut self.header_label,
+                );
+                self.refresh_header_left_rect();
+            }
         }
         if self.header_hot {
             if let Some(rect) = self.header_left_rect {
@@ -977,6 +993,15 @@ impl HudOverlay {
                     48,
                 );
             }
+        }
+        if !self.uses_monitor_map() {
+            draw_pin(
+                self.pixels,
+                self.virtual_screen.width,
+                self.virtual_screen.height,
+                self.pin_screen.x - self.virtual_screen.x,
+                self.pin_screen.y - self.virtual_screen.y,
+            );
         }
         if let Some(rect) = self.badge_rect {
             draw_suggestion_badge(
@@ -1250,6 +1275,9 @@ impl HudOverlay {
                 dib.pixels,
                 w,
                 h,
+                0,
+                0,
+                w,
                 self.header_h,
                 &mut self.header_label,
             );
@@ -1284,20 +1312,23 @@ fn paint_header(
     pixels: *mut u8,
     width: i32,
     height: i32,
+    origin_x: i32,
+    origin_y: i32,
+    panel_w: i32,
     header_h: i32,
     cache: &mut Option<HeaderLabel>,
 ) {
     fill_rect_premul(
-        pixels, width, height, 0, 0, width, header_h, 18, 20, 26, 235,
+        pixels, width, height, origin_x, origin_y, panel_w, header_h, 18, 20, 26, 235,
     );
     if header_h > 1 {
         fill_rect_premul(
             pixels,
             width,
             height,
-            0,
-            header_h - 1,
-            width,
+            origin_x,
+            origin_y + header_h - 1,
+            panel_w,
             1,
             70,
             82,
@@ -1312,15 +1343,15 @@ fn paint_header(
             pixels,
             width,
             height,
-            inset,
-            inset,
+            origin_x + inset,
+            origin_y + inset,
             &icon.bgra,
             icon_px as i32,
             icon_px as i32,
         );
     }
     let text_left = inset + icon_px as i32 + 6;
-    let available = width - text_left - (BADGE_SIZE_PX + 8);
+    let available = panel_w - text_left - (BADGE_SIZE_PX + 8);
     let font_px = (header_h * 5 / 8).clamp(11, 18);
     let Some(text) = fitting_header_text(available, font_px, cache) else {
         return;
@@ -1333,8 +1364,8 @@ fn paint_header(
         pixels,
         width,
         height,
-        text_left,
-        text_y,
+        origin_x + text_left,
+        origin_y + text_y,
         label.width,
         label.height,
         &label.coverage,
@@ -1598,26 +1629,23 @@ fn blend_straight_pixel(
     }
 }
 
-fn draw_hud(
+fn draw_grid(
     pixels: *mut u8,
     width: i32,
     height: i32,
     vs: VirtualScreen,
-    pin_screen: POINT,
     panel_screen: RECT,
     hover_cell: Option<(usize, usize)>,
+    header_h: i32,
 ) {
-    let pin_x = pin_screen.x - vs.x;
-    let pin_y = pin_screen.y - vs.y;
-
     let panel_left = panel_screen.left - vs.x;
-    let panel_top = panel_screen.top - vs.y;
+    let grid_top = panel_screen.top - vs.y + header_h.max(0);
     fill_rect_premul(
         pixels,
         width,
         height,
         panel_left,
-        panel_top,
+        grid_top,
         MINIMAP_PANEL_PX,
         MINIMAP_PANEL_PX,
         20,
@@ -1633,7 +1661,7 @@ fn draw_hud(
             width,
             height,
             panel_left + col as i32 * cell,
-            panel_top + row as i32 * cell,
+            grid_top + row as i32 * cell,
             cell,
             cell,
             120,
@@ -1646,13 +1674,13 @@ fn draw_hud(
     let cell = MINIMAP_CELL_PX;
     for i in 1..MINIMAP_GRID as i32 {
         let x = panel_left + i * cell;
-        let y = panel_top + i * cell;
+        let y = grid_top + i * cell;
         fill_rect_premul(
             pixels,
             width,
             height,
             x,
-            panel_top,
+            grid_top,
             1,
             MINIMAP_PANEL_PX,
             255,
@@ -1679,51 +1707,13 @@ fn draw_hud(
         width,
         height,
         panel_left,
-        panel_top,
+        grid_top,
         MINIMAP_PANEL_PX,
         MINIMAP_PANEL_PX,
         255,
         255,
         255,
         140,
-    );
-
-    fill_circle_premul(
-        pixels,
-        width,
-        height,
-        pin_x,
-        pin_y,
-        PIN_OUTER_RADIUS,
-        80,
-        180,
-        255,
-        90,
-    );
-    stroke_circle_premul(
-        pixels,
-        width,
-        height,
-        pin_x,
-        pin_y,
-        PIN_MID_RADIUS,
-        120,
-        200,
-        255,
-        160,
-        2,
-    );
-    fill_circle_premul(
-        pixels,
-        width,
-        height,
-        pin_x,
-        pin_y,
-        PIN_INNER_RADIUS,
-        200,
-        230,
-        255,
-        200,
     );
 }
 

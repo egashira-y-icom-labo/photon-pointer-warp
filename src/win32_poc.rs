@@ -1688,15 +1688,14 @@ fn handle_hud_left_button_up() {
             dismiss_hud_with_log(HudCloseReason::OriginClick);
         }
         HudHit::Monitor { index, target } => {
-            let monitor_map = guard.hud.uses_monitor_map();
             drop(guard);
-            if monitor_map {
-                warp_hud_to_point(target.x, target.y, format!("monitor {}", index + 1));
-            } else {
-                let col = index % MINIMAP_GRID;
-                let row = index / MINIMAP_GRID;
-                warp_hud_to_cell(col, row);
-            }
+            warp_hud_to_point(target.x, target.y, format!("monitor {}", index + 1));
+        }
+        HudHit::Cell { index } => {
+            let col = index % MINIMAP_GRID;
+            let row = index / MINIMAP_GRID;
+            drop(guard);
+            warp_hud_to_cell(col, row);
         }
         HudHit::PanelEmpty => {}
         HudHit::Outside => {

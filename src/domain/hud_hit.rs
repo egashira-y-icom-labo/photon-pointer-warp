@@ -14,6 +14,8 @@ pub enum HudHit {
     HeaderLeft,
     Origin,
     Monitor { index: usize, target: Point },
+    /// 3×3 グリッドのセル。`index` は行優先で 0 から 8。
+    Cell { index: usize },
     PanelEmpty,
     Outside,
 }
@@ -27,9 +29,10 @@ pub struct HudHitRegions {
     pub pin: Point,
     pub origin_radius: i32,
     pub monitor: Option<(usize, Point)>,
+    pub cell: Option<usize>,
 }
 
-/// 優先順位: バッジ、ヘッダー左、原点、モニター、パネル内の空き、外側。
+/// 優先順位: バッジ、ヘッダー左、原点、モニター、グリッドセル、パネル内の空き、外側。
 pub fn classify_hud_hit(screen: Point, regions: HudHitRegions) -> HudHit {
     if regions
         .badge
@@ -48,6 +51,9 @@ pub fn classify_hud_hit(screen: Point, regions: HudHitRegions) -> HudHit {
     }
     if let Some((index, target)) = regions.monitor {
         return HudHit::Monitor { index, target };
+    }
+    if let Some(index) = regions.cell {
+        return HudHit::Cell { index };
     }
     if regions.panel.contains((screen.x, screen.y)) {
         return HudHit::PanelEmpty;
@@ -92,6 +98,7 @@ mod tests {
             pin: Point { x: 20, y: 30 },
             origin_radius: 15,
             monitor: None,
+            cell: None,
         }
     }
 
@@ -165,6 +172,24 @@ mod tests {
         assert_eq!(
             classify_hud_hit(Point { x: 8, y: 30 }, regions),
             HudHit::Origin
+        );
+    }
+
+    #[test]
+    fn header_and_origin_beat_a_grid_cell() {
+        let mut regions = regions();
+        regions.cell = Some(4);
+        assert_eq!(
+            classify_hud_hit(Point { x: 20, y: 16 }, regions),
+            HudHit::HeaderLeft
+        );
+        assert_eq!(
+            classify_hud_hit(Point { x: 20, y: 30 }, regions),
+            HudHit::Origin
+        );
+        assert_eq!(
+            classify_hud_hit(Point { x: 40, y: 70 }, regions),
+            HudHit::Cell { index: 4 }
         );
     }
 
