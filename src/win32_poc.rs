@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime};
 
@@ -13,19 +14,22 @@ use photon_pointer_warp::domain::adaptation::{
 };
 use photon_pointer_warp::domain::calibration::{analyze_relative_stroke, StrokeMetrics};
 use photon_pointer_warp::domain::circle::{CircleDetector, GestureWindowStats, MotionSample};
-use photon_pointer_warp::domain::config::{effective_hud_style, AppConfig};
+use photon_pointer_warp::domain::config::{
+    effective_hud_style, normalize_thumbnail_dim, AppConfig, HudBackground,
+};
 use photon_pointer_warp::domain::monitor_layout::clamp_to_monitors;
 use photon_pointer_warp::domain::settle::{decide_settle, policy_for, SettleDecision};
 use photon_pointer_warp::domain::shake::ShakeDetector;
 use photon_pointer_warp::domain::tracking::{TrackingAction, TrackingController};
 use photon_pointer_warp::domain::trigger::{TriggerCoordinator, TriggerSource};
 use photon_pointer_warp::platform::calibrate_window::CALIBRATE_MUTEX_NAME;
+use photon_pointer_warp::platform::capture::{capture_thumbnails, ThumbnailLayer};
 use photon_pointer_warp::platform::layout::warp_target_for_cell;
 use photon_pointer_warp::platform::monitors::{capture_display_snapshot, DisplaySnapshot};
 use photon_pointer_warp::platform::startup;
 use photon_pointer_warp::platform::tray::{
     TrayEvent, TrayIcon, IDM_APPLY_SUGGESTION, IDM_CALIBRATE, IDM_DISMISS_SUGGESTION, IDM_EXIT,
-    IDM_PAUSE, IDM_STARTUP, WM_TRAYICON,
+    IDM_PAUSE, IDM_STARTUP, IDM_TOGGLE_THUMBNAIL, WM_TRAYICON,
 };
 use photon_pointer_warp::platform::window::HudOverlay;
 use windows::core::w;
@@ -67,9 +71,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, KillTimer, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
     RegisterWindowMessageW, SetCursorPos, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
     ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWL_EXSTYLE, MSG, PM_REMOVE, SW_HIDE,
-    WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_HOTKEY, WM_INPUT, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_MBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCMBUTTONDBLCLK, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_HOTKEY, WM_INPUT, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_MBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCMBUTTONDBLCLK, WM_SETTINGCHANGE,
+    WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 #[cfg(debug_assertions)]
 use windows::Win32::UI::WindowsAndMessaging::{IsIconic, SW_RESTORE, SW_SHOW};
@@ -90,6 +94,7 @@ const TRACK_TIMER_ID: usize = 3;
 const DISPLAY_TIMER_ID: usize = 4;
 const ESC_HOTKEY_ID: i32 = 2;
 const WM_OPEN_ADJUST: u32 = WM_APP + 2;
+const WM_THUMBNAIL_READY: u32 = WM_APP + 3;
 const DEBUG_TIMER_MS: u32 = 100;
 const TRACK_TIMER_MS: u32 = 16;
 const DISPLAY_DEBOUNCE_MS: u32 = 300;
@@ -139,6 +144,12 @@ struct AppState {
     hud: HudOverlay,
     display: DisplaySnapshot,
     hud_style: photon_pointer_warp::domain::config::HudStyle,
+    hud_background: HudBackground,
+    hud_thumbnail_dim: f32,
+    thumbnail_generation: u64,
+    thumbnail_tx: Sender<ThumbnailResult>,
+    thumbnail_rx: Receiver<ThumbnailResult>,
+    pending_thumbnail: Option<(u64, ThumbnailLayer)>,
     esc_hotkey_registered: bool,
     clock_origin: Instant,
     hud_phase: HudPhase,
@@ -159,6 +170,12 @@ struct AppState {
     hud_opened_at: Option<Instant>,
     hud_opened_cursor: Option<(i32, i32)>,
     feedback_circle_hud: bool,
+}
+
+struct ThumbnailResult {
+    generation: u64,
+    elapsed_ms: f64,
+    result: Result<ThumbnailLayer, String>,
 }
 
 static APP: OnceLock<Mutex<AppState>> = OnceLock::new();
@@ -316,6 +333,10 @@ pub fn run(config: AppConfig) -> io::Result<()> {
 
         let mut hud = HudOverlay::create(instance, hud_wnd_proc)
             .map_err(|e| io::Error::other(format!("HudOverlay::create: {e}")))?;
+        hud.configure_background(
+            config.hud_background,
+            normalize_thumbnail_dim(config.hud_thumbnail_dim),
+        )?;
         let display = capture_display_snapshot();
         if !display.monitors.is_empty() && display.virtual_screen != hud.virtual_screen() {
             hud.rebuild_display()
@@ -329,6 +350,7 @@ pub fn run(config: AppConfig) -> io::Result<()> {
         );
         let tray =
             TrayIcon::add(hwnd, instance).map_err(|e| io::Error::other(format!("tray: {e}")))?;
+        let (thumbnail_tx, thumbnail_rx) = mpsc::channel();
 
         APP.get_or_init(|| {
             Mutex::new(AppState {
@@ -342,6 +364,12 @@ pub fn run(config: AppConfig) -> io::Result<()> {
                 hud,
                 display,
                 hud_style: config.hud_style,
+                hud_background: config.hud_background,
+                hud_thumbnail_dim: normalize_thumbnail_dim(config.hud_thumbnail_dim),
+                thumbnail_generation: 0,
+                thumbnail_tx,
+                thumbnail_rx,
+                pending_thumbnail: None,
                 esc_hotkey_registered: false,
                 clock_origin: Instant::now(),
                 hud_phase: HudPhase::Idle,
@@ -448,6 +476,12 @@ unsafe extern "system" fn wnd_proc(
             unsafe { restore_menu_owner(hwnd) };
             LRESULT(0)
         }
+        WM_THUMBNAIL_READY => {
+            if let Some(mut guard) = APP.get().and_then(|app| app.try_lock().ok()) {
+                apply_thumbnail_results(&mut guard);
+            }
+            LRESULT(0)
+        }
         WM_HOTKEY => {
             if wparam.0 as i32 == ESC_HOTKEY_ID {
                 dismiss_hud_with_log(HudCloseReason::EscapeKey);
@@ -523,8 +557,95 @@ fn reload_detector_from_disk(state: &mut AppState) {
         let _ = io::stdout().flush();
         state.hud_style = cfg.hud_style;
     }
+    let dim = normalize_thumbnail_dim(cfg.hud_thumbnail_dim);
+    if cfg.hud_background != state.hud_background || dim != state.hud_thumbnail_dim {
+        state.hud_background = cfg.hud_background;
+        state.hud_thumbnail_dim = dim;
+        state.thumbnail_generation = state.thumbnail_generation.wrapping_add(1);
+        state.pending_thumbnail = None;
+        if let Err(err) = state.hud.configure_background(cfg.hud_background, dim) {
+            eprintln!("[thumb] background reconfigure: {err}");
+        }
+    }
     cancel_settling(state);
     state.config_mtime = config_file_mtime();
+}
+
+fn request_thumbnail(state: &mut AppState) {
+    if state.hud_background != HudBackground::Thumbnail {
+        return;
+    }
+    let requests = state.hud.thumbnail_requests();
+    if requests.is_empty() {
+        return;
+    }
+    state.thumbnail_generation = state.thumbnail_generation.wrapping_add(1);
+    let generation = state.thumbnail_generation;
+    state.pending_thumbnail = None;
+    let dim = state.hud.thumbnail_dim();
+    let sender = state.thumbnail_tx.clone();
+    let hwnd_raw = MESSAGE_HWND.load(Ordering::Acquire);
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let result = unsafe { capture_thumbnails(&requests, dim) }.map_err(|err| err.to_string());
+        let completion = ThumbnailResult {
+            generation,
+            elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+            result,
+        };
+        if sender.send(completion).is_ok() && hwnd_raw != 0 {
+            unsafe {
+                let _ = PostMessageW(
+                    HWND(hwnd_raw as _),
+                    WM_THUMBNAIL_READY,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+    });
+}
+
+fn apply_thumbnail_results(state: &mut AppState) {
+    while let Ok(completion) = state.thumbnail_rx.try_recv() {
+        if completion.generation != state.thumbnail_generation
+            || state.hud_background != HudBackground::Thumbnail
+        {
+            continue;
+        }
+        match completion.result {
+            Ok(thumbnail) => {
+                let count = thumbnail.monitor_count();
+                println!(
+                    "[thumb] Captured {count} monitors in {:.1} ms",
+                    completion.elapsed_ms
+                );
+                let _ = io::stdout().flush();
+                if state.hud.is_active() {
+                    if let Err(err) = state.hud.apply_thumbnail(thumbnail) {
+                        eprintln!("[thumb] apply failed: {err}");
+                    }
+                } else {
+                    state.pending_thumbnail = Some((completion.generation, thumbnail));
+                }
+            }
+            Err(err) => eprintln!("[thumb] capture failed: {err}"),
+        }
+    }
+}
+
+fn apply_pending_thumbnail(state: &mut AppState) {
+    let Some((generation, thumbnail)) = state.pending_thumbnail.take() else {
+        return;
+    };
+    if generation == state.thumbnail_generation
+        && state.hud_background == HudBackground::Thumbnail
+        && state.hud.is_active()
+    {
+        if let Err(err) = state.hud.apply_thumbnail(thumbnail) {
+            eprintln!("[thumb] apply failed: {err}");
+        }
+    }
 }
 
 fn schedule_display_refresh(hwnd: HWND) {
@@ -572,21 +693,13 @@ unsafe fn foreground_menu_owner(hwnd: HWND) {
     let _ = ReleaseCapture();
     discard_queued_mouse_clicks();
     let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    let _ = SetWindowLongPtrW(
-        hwnd,
-        GWL_EXSTYLE,
-        style & !(WS_EX_NOACTIVATE.0 as isize),
-    );
+    let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style & !(WS_EX_NOACTIVATE.0 as isize));
     let _ = SetForegroundWindow(hwnd);
 }
 
 unsafe fn restore_menu_owner(hwnd: HWND) {
     let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-    let _ = SetWindowLongPtrW(
-        hwnd,
-        GWL_EXSTYLE,
-        style | WS_EX_NOACTIVATE.0 as isize,
-    );
+    let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE.0 as isize);
 }
 
 fn open_adjust_menu() {
@@ -600,14 +713,16 @@ fn open_adjust_menu() {
         };
         Some((
             guard.detection_paused,
+            guard.hud_background == HudBackground::Thumbnail,
             tray.hwnd(),
             guard.pending_suggestion.as_ref().map(|s| s.summary.clone()),
         ))
     };
-    let Some((paused, hwnd, suggestion)) = prepared else {
+    let Some((paused, thumbnail_enabled, hwnd, suggestion)) = prepared else {
         return;
     };
-    let cmd_id = unsafe { TrayIcon::track_menu(hwnd, paused, suggestion.as_deref()) };
+    let cmd_id =
+        unsafe { TrayIcon::track_menu(hwnd, paused, thumbnail_enabled, suggestion.as_deref()) };
     if cmd_id != 0 {
         handle_tray_command_sync(hwnd, cmd_id);
     }
@@ -639,6 +754,8 @@ fn enter_calibrating(state: &mut AppState) {
     if !state.hud.is_active() {
         return;
     }
+    state.thumbnail_generation = state.thumbnail_generation.wrapping_add(1);
+    state.pending_thumbnail = None;
     clear_hud_feedback_clock(state);
     state.chained_warp_started_at = None;
     if let Err(e) = unsafe { state.hud.dismiss() } {
@@ -699,7 +816,7 @@ fn poll_config_and_calibrate_child() {
 fn handle_tray_callback(lparam: LPARAM) {
     match TrayIcon::callback_event(lparam) {
         Some(TrayEvent::ContextMenu) => {
-            let (paused, hwnd, suggestion) = {
+            let (paused, thumbnail_enabled, hwnd, suggestion) = {
                 let guard = match APP.get().and_then(|a| a.try_lock().ok()) {
                     Some(g) => g,
                     None => return,
@@ -709,12 +826,15 @@ fn handle_tray_callback(lparam: LPARAM) {
                 };
                 (
                     guard.detection_paused,
+                    guard.hud_background == HudBackground::Thumbnail,
                     tray.hwnd(),
                     guard.pending_suggestion.as_ref().map(|s| s.summary.clone()),
                 )
             };
 
-            let cmd_id = unsafe { TrayIcon::track_menu(hwnd, paused, suggestion.as_deref()) };
+            let cmd_id = unsafe {
+                TrayIcon::track_menu(hwnd, paused, thumbnail_enabled, suggestion.as_deref())
+            };
             if cmd_id != 0 {
                 handle_tray_command_sync(hwnd, cmd_id);
             }
@@ -751,6 +871,32 @@ fn handle_tray_command_sync(hwnd: HWND, id: u32) {
             let enabled = startup::is_startup_enabled();
             if let Err(e) = startup::set_startup_enabled(!enabled) {
                 eprintln!("startup toggle: {e}");
+            }
+        }
+        IDM_TOGGLE_THUMBNAIL => {
+            if let Some(mut guard) = APP.get().and_then(|a| a.try_lock().ok()) {
+                let next = match guard.hud_background {
+                    HudBackground::Thumbnail => HudBackground::Flat,
+                    HudBackground::Flat => HudBackground::Thumbnail,
+                };
+                guard.hud_background = next;
+                guard.thumbnail_generation = guard.thumbnail_generation.wrapping_add(1);
+                guard.pending_thumbnail = None;
+                let dim = guard.hud_thumbnail_dim;
+                if let Err(err) = guard.hud.configure_background(next, dim) {
+                    eprintln!("[thumb] background toggle: {err}");
+                }
+                let mut config = AppConfig::load_or_default();
+                config.hud_background = next;
+                config.hud_thumbnail_dim = guard.hud_thumbnail_dim;
+                if let Err(err) = config.save() {
+                    eprintln!("[thumb] background save: {err}");
+                } else {
+                    guard.config_mtime = config_file_mtime();
+                }
+                if next == HudBackground::Thumbnail && guard.hud.is_active() {
+                    request_thumbnail(&mut guard);
+                }
             }
         }
         IDM_APPLY_SUGGESTION => {
@@ -851,6 +997,7 @@ fn begin_tracking(guard: &mut AppState, now: Instant) -> io::Result<()> {
     let (x, y) = cursor_screen_pos().unwrap_or((0, 0));
     let t = mono_ms(guard.clock_origin, now);
     unsafe { guard.hud.activate_tracking(POINT { x, y })? };
+    request_thumbnail(guard);
     guard.hud_phase = HudPhase::Tracking {
         controller: TrackingController::new(t, (x, y)),
         last_paint_ms: t,
@@ -992,6 +1139,7 @@ fn open_hud_after_settle(
             .activate_at_cursor(hint.as_deref())
             .map_err(|e| io::Error::other(format!("HUD activate: {e}")))?
     };
+    apply_pending_thumbnail(guard);
     let dpi = unsafe { GetDpiForSystem() };
     println!("{}", hud_diag.format_line(dpi));
     let _ = io::stdout().flush();
@@ -1152,6 +1300,9 @@ unsafe fn handle_wm_input(lparam: LPARAM) -> io::Result<()> {
                     source: result.source,
                     is_learning_target: result.is_learning_target,
                 });
+                let _ = refresh_display_if_stale(&mut guard)?;
+                bind_hud_map(&mut guard);
+                request_thumbnail(&mut guard);
             }
             TriggerSource::Shake => begin_tracking(&mut guard, now)?,
         }
@@ -1362,6 +1513,8 @@ fn dismiss_hud_locked(guard: &mut AppState, message_hwnd: HWND, reason: HudClose
     if !guard.hud.is_active() {
         return;
     }
+    guard.thumbnail_generation = guard.thumbnail_generation.wrapping_add(1);
+    guard.pending_thumbnail = None;
     maybe_record_accidental(guard, reason);
     clear_hud_feedback_clock(guard);
     guard.hud_phase = HudPhase::Idle;

@@ -27,6 +27,14 @@ fn default_hud_style() -> HudStyle {
     HudStyle::Monitors
 }
 
+fn default_hud_background() -> HudBackground {
+    HudBackground::Thumbnail
+}
+
+fn default_hud_thumbnail_dim() -> f32 {
+    0.4
+}
+
 /// HUD の目標表現。描画の切り替えは後続ステップで使い、今は設定として保持する。
 /// モニターが 1 枚以下のときの実効値は [`effective_hud_style`] が `"grid"` に倒す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +50,30 @@ impl HudStyle {
             Self::Monitors => "monitors",
             Self::Grid => "grid",
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HudBackground {
+    Thumbnail,
+    Flat,
+}
+
+impl HudBackground {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Thumbnail => "thumbnail",
+            Self::Flat => "flat",
+        }
+    }
+}
+
+pub fn normalize_thumbnail_dim(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.2, 0.8)
+    } else {
+        default_hud_thumbnail_dim()
     }
 }
 
@@ -63,6 +95,10 @@ pub struct AppConfig {
     pub detector: DetectorConfig,
     #[serde(default = "default_hud_style")]
     pub hud_style: HudStyle,
+    #[serde(default = "default_hud_background")]
+    pub hud_background: HudBackground,
+    #[serde(default = "default_hud_thumbnail_dim")]
+    pub hud_thumbnail_dim: f32,
 }
 
 impl Default for AppConfig {
@@ -71,6 +107,8 @@ impl Default for AppConfig {
             version: CONFIG_VERSION,
             detector: poc_detector(),
             hud_style: default_hud_style(),
+            hud_background: default_hud_background(),
+            hud_thumbnail_dim: default_hud_thumbnail_dim(),
         }
     }
 }
@@ -135,12 +173,15 @@ mod tests {
         assert_eq!(cfg.detector.closure_rms_factor, 0.65);
         assert_eq!(cfg.detector.closure_disp_min_px, 10.0);
         assert_eq!(cfg.hud_style, HudStyle::Monitors);
+        assert_eq!(cfg.hud_background, HudBackground::Thumbnail);
+        assert_eq!(cfg.hud_thumbnail_dim, 0.4);
     }
 
     #[test]
     fn missing_hud_style_defaults_to_monitors() {
         let parsed: AppConfig = toml::from_str("version = 1\n").unwrap();
         assert_eq!(parsed.hud_style, HudStyle::Monitors);
+        assert_eq!(parsed.hud_background, HudBackground::Thumbnail);
         assert!(parsed.detector.allow_thumb_partial_closure);
     }
 
@@ -159,6 +200,21 @@ mod tests {
             HudStyle::Monitors
         );
         assert_eq!(effective_hud_style(HudStyle::Grid, 3), HudStyle::Grid);
+    }
+
+    #[test]
+    fn thumbnail_background_roundtrips_and_dim_is_bounded() {
+        let mut cfg = AppConfig::default();
+        cfg.hud_background = HudBackground::Flat;
+        cfg.hud_thumbnail_dim = 0.65;
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(text.contains("hud_background = \"flat\""));
+        let parsed: AppConfig = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.hud_background, HudBackground::Flat);
+        assert_eq!(normalize_thumbnail_dim(parsed.hud_thumbnail_dim), 0.65);
+        assert_eq!(normalize_thumbnail_dim(-1.0), 0.2);
+        assert_eq!(normalize_thumbnail_dim(2.0), 0.8);
+        assert_eq!(normalize_thumbnail_dim(f32::NAN), 0.4);
     }
 
     #[test]

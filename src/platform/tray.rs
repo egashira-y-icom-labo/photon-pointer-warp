@@ -26,6 +26,7 @@ pub const IDM_EXIT: usize = 4003;
 pub const IDM_APPLY_SUGGESTION: usize = 4004;
 pub const IDM_DISMISS_SUGGESTION: usize = 4005;
 pub const IDM_STARTUP: usize = 4006;
+pub const IDM_TOGGLE_THUMBNAIL: usize = 4007;
 
 const TIP_ACTIVE: &str = "Photon Pointer Warp";
 const TIP_PAUSED: &str = "Photon Pointer Warp (一時停止中)";
@@ -102,7 +103,12 @@ impl TrayIcon {
     }
 
     /// モーダルメニューを出し、選択 ID を返す（キャンセルは 0）。`WM_COMMAND` は送らない。
-    pub unsafe fn track_menu(hwnd: HWND, paused: bool, suggestion: Option<&str>) -> u32 {
+    pub unsafe fn track_menu(
+        hwnd: HWND,
+        paused: bool,
+        thumbnail_enabled: bool,
+        suggestion: Option<&str>,
+    ) -> u32 {
         let mut pt = POINT::default();
         if GetCursorPos(&mut pt).is_err() {
             return 0;
@@ -140,6 +146,17 @@ impl TrayIcon {
             MF_STRING | MF_UNCHECKED
         };
         let _ = AppendMenuW(menu, startup_flags, IDM_STARTUP, w!("Windows 起動時に実行"));
+        let thumbnail_flags = if thumbnail_enabled {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING | MF_UNCHECKED
+        };
+        let _ = AppendMenuW(
+            menu,
+            thumbnail_flags,
+            IDM_TOGGLE_THUMBNAIL,
+            w!("デスクトップ背景表示"),
+        );
         let pause_flags = if paused {
             MF_STRING | MF_CHECKED
         } else {

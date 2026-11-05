@@ -3,8 +3,11 @@
 use std::io;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
-use crate::domain::config::{effective_hud_style, HudStyle};
-use crate::domain::monitor_layout::{panel_limits, MinimapGeometry, Monitor, Rect};
+use crate::domain::config::{
+    effective_hud_style, normalize_thumbnail_dim, HudBackground, HudStyle,
+};
+use crate::domain::monitor_layout::{panel_limits, sort_monitors, MinimapGeometry, Monitor, Rect};
+use crate::platform::capture::{CaptureRequest, ThumbnailLayer};
 use crate::platform::layout::{
     anchor_panel_within, grid_pin_offsets, is_pointer_out_of_bounds, minimap_cell_at,
     point_within_radius, PanelScreenRect, VirtualScreen, DISMISS_OUT_OF_BOUNDS_MARGIN_PX,
@@ -21,10 +24,11 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, GetSystemMetrics, LoadCursorW, RegisterClassW, SetCursor, SetCursorPos,
-    SetWindowPos, ShowWindow, UpdateLayeredWindowIndirect, CS_HREDRAW, CS_VREDRAW, HCURSOR,
-    HWND_TOPMOST, IDC_ARROW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA,
-    UPDATELAYEREDWINDOWINFO, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    SetWindowDisplayAffinity, SetWindowPos, ShowWindow, UpdateLayeredWindowIndirect, CS_HREDRAW,
+    CS_VREDRAW, HCURSOR, HWND_TOPMOST, IDC_ARROW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA,
+    UPDATELAYEREDWINDOWINFO, WDA_EXCLUDEFROMCAPTURE, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 
 const HUD_CLASS: windows::core::PCWSTR = w!("PhotonPointerWarpHud");
@@ -156,6 +160,9 @@ pub struct HudOverlay {
     /// 提案バッジの画面座標。提案がある固定中だけ Some。
     badge_rect: Option<RECT>,
     badge_hot: bool,
+    background: HudBackground,
+    thumbnail_dim: f32,
+    thumbnail: Option<ThumbnailLayer>,
 }
 
 // HWND / DIB はメッセージスレッドのみで使用する
@@ -197,6 +204,7 @@ impl HudOverlay {
         .map_err(|e| io::Error::other(format!("CreateWindowExW HUD: {e}")))?;
 
         HUD_HWND.store(hwnd.0 as isize, Ordering::Release);
+        exclude_hud_from_capture(hwnd);
 
         let dib = create_dib_section(vs.width, vs.height)?;
 
@@ -228,6 +236,9 @@ impl HudOverlay {
             last_panel_rect: None,
             badge_rect: None,
             badge_hot: false,
+            background: HudBackground::Thumbnail,
+            thumbnail_dim: 0.4,
+            thumbnail: None,
         };
 
         overlay.present(None)?;
@@ -262,6 +273,7 @@ impl HudOverlay {
         self.last_panel_rect = None;
         self.badge_rect = None;
         self.badge_hot = false;
+        self.discard_thumbnail();
         self.hover_cell = None;
         self.monitor_hover = None;
         self.suggestion_hint = None;
@@ -365,6 +377,90 @@ impl HudOverlay {
 
     pub fn uses_monitor_map(&self) -> bool {
         self.map_style == HudStyle::Monitors && self.geometry.is_some()
+    }
+
+    pub fn configure_background(&mut self, background: HudBackground, dim: f32) -> io::Result<()> {
+        let dim = normalize_thumbnail_dim(dim);
+        if self.background == background && self.thumbnail_dim == dim {
+            return Ok(());
+        }
+        self.background = background;
+        self.thumbnail_dim = dim;
+        if background == HudBackground::Flat {
+            self.discard_thumbnail();
+        }
+        self.map_generation = self.map_generation.wrapping_add(1);
+        if self.active {
+            self.redraw()?;
+        }
+        Ok(())
+    }
+
+    pub fn thumbnail_enabled(&self) -> bool {
+        self.background == HudBackground::Thumbnail && self.uses_monitor_map()
+    }
+
+    pub fn thumbnail_dim(&self) -> f32 {
+        self.thumbnail_dim
+    }
+
+    pub fn thumbnail_requests(&self) -> Vec<CaptureRequest> {
+        if !self.thumbnail_enabled() {
+            return Vec::new();
+        }
+        let Some(geometry) = &self.geometry else {
+            return Vec::new();
+        };
+        let mut monitors: Vec<Monitor> = self
+            .monitors
+            .iter()
+            .copied()
+            .filter(|monitor| monitor.rect.is_valid())
+            .collect();
+        sort_monitors(&mut monitors);
+        if monitors.len() != geometry.blocks.len() {
+            return Vec::new();
+        }
+        monitors
+            .into_iter()
+            .zip(&geometry.blocks)
+            .filter_map(|(monitor, block)| {
+                let dest_w = block.width();
+                let dest_h = block.height();
+                if dest_w <= 0 || dest_h <= 0 {
+                    None
+                } else {
+                    Some(CaptureRequest {
+                        src: monitor.rect,
+                        dest: *block,
+                    })
+                }
+            })
+            .collect()
+    }
+
+    pub fn apply_thumbnail(&mut self, thumbnail: ThumbnailLayer) -> io::Result<()> {
+        if !self.active || !self.thumbnail_enabled() {
+            return Ok(());
+        }
+        self.discard_thumbnail();
+        self.thumbnail = Some(thumbnail);
+        self.map_generation = self.map_generation.wrapping_add(1);
+        self.redraw()
+    }
+
+    fn discard_thumbnail(&mut self) {
+        if let Some(mut cache) = self.thumbnail.take() {
+            cache.clear();
+        }
+        self.clear_map_cache();
+    }
+
+    fn clear_map_cache(&mut self) {
+        if let Some(cache) = self.map_cache.as_mut() {
+            cache.pixels.fill(0);
+        }
+        self.map_cache = None;
     }
 
     /// モニターブロック内のクリックを、その画面上の着地点へ解決する。
@@ -604,6 +700,7 @@ impl HudOverlay {
         self.suggestion_hint = None;
         self.badge_rect = None;
         self.badge_hot = false;
+        self.discard_thumbnail();
         self.mode = HudMode::Anchored;
         clear_pixels(self.pixels, self.pixel_len);
         self.last_panel_rect = None;
@@ -800,7 +897,14 @@ impl Drop for HudOverlay {
                 let _ = ReleaseCapture();
             }
             self.destroy_dib();
+            self.discard_thumbnail();
         }
+    }
+}
+
+unsafe fn exclude_hud_from_capture(hwnd: HWND) {
+    if let Err(err) = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) {
+        eprintln!("[thumb] display affinity: {err}");
     }
 }
 
@@ -990,7 +1094,14 @@ impl HudOverlay {
         let w = self.panel_w.max(1);
         let h = self.panel_h.max(1);
         let dib = unsafe { create_dib_section(w, h)? };
-        paint_monitor_blocks(dib.pixels, w, h, &geometry.blocks, highlight);
+        paint_monitor_blocks(
+            dib.pixels,
+            w,
+            h,
+            &geometry.blocks,
+            self.thumbnail.as_ref(),
+            highlight,
+        );
         unsafe { paint_monitor_labels(dib.dc, dib.pixels, w, h, &geometry.blocks) };
         let mut pixels = vec![0u8; dib.len];
         unsafe {
@@ -1001,6 +1112,7 @@ impl HudOverlay {
             );
             discard_dib(dib);
         }
+        self.clear_map_cache();
         self.map_cache = Some(MapCache {
             w,
             h,
@@ -1146,29 +1258,46 @@ fn paint_monitor_blocks(
     width: i32,
     height: i32,
     blocks: &[Rect],
+    thumbnail: Option<&ThumbnailLayer>,
     highlight: Option<usize>,
 ) {
     fill_rect_premul(pixels, width, height, 0, 0, width, height, 12, 14, 18, 176);
     for (index, block) in blocks.iter().enumerate() {
         let hot = highlight == Some(index);
-        let (r, g, b, a) = if hot {
-            (72, 132, 188, 220)
-        } else {
-            (34, 46, 62, 214)
-        };
-        fill_rect_premul(
-            pixels,
-            width,
-            height,
-            block.left,
-            block.top,
-            block.width(),
-            block.height(),
-            r,
-            g,
-            b,
-            a,
-        );
+        if let Some(thumbnail) = thumbnail {
+            if let Some(image) = thumbnail.blocks().get(index) {
+                blit_premul(
+                    pixels,
+                    width,
+                    height,
+                    image.dest.left,
+                    image.dest.top,
+                    image.pixels(),
+                    image.dest.width(),
+                    image.dest.height(),
+                );
+            }
+        }
+        if hot || thumbnail.is_none() {
+            let (r, g, b, a) = if hot {
+                (72, 132, 188, 130)
+            } else {
+                (34, 46, 62, 214)
+            };
+            fill_rect_premul(
+                pixels,
+                width,
+                height,
+                block.left,
+                block.top,
+                block.width(),
+                block.height(),
+                r,
+                g,
+                b,
+                a,
+            );
+        }
         let (br, bg, bb, ba) = if hot {
             (196, 232, 255, 240)
         } else {
@@ -1214,7 +1343,12 @@ unsafe fn paint_monitor_labels(dc: HDC, pixels: *mut u8, width: i32, height: i32
         );
         let old_font = SelectObject(dc, font);
         SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, COLORREF((255u32) << 16 | (244u32) << 8 | 236));
+        let mut shadow_rect = RECT {
+            left: block.left + 1,
+            top: block.top + 1,
+            right: block.right + 1,
+            bottom: block.bottom + 1,
+        };
         let mut rect = RECT {
             left: block.left,
             top: block.top,
@@ -1224,6 +1358,14 @@ unsafe fn paint_monitor_labels(dc: HDC, pixels: *mut u8, width: i32, height: i32
         let repair = rect;
         let text = format!("{}", index + 1);
         let mut wide: Vec<u16> = text.encode_utf16().collect();
+        SetTextColor(dc, COLORREF(0));
+        let _ = DrawTextW(
+            dc,
+            &mut wide,
+            &mut shadow_rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        SetTextColor(dc, COLORREF((255u32) << 16 | (244u32) << 8 | 236));
         let _ = DrawTextW(
             dc,
             &mut wide,
