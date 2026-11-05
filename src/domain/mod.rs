@@ -1,5 +1,6 @@
 pub mod adaptation;
 pub mod calibration;
+pub mod hud_hit;
 pub mod circle;
 pub mod config;
 pub mod monitor_layout;

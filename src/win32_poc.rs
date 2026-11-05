@@ -17,6 +17,7 @@ use photon_pointer_warp::domain::circle::{CircleDetector, GestureWindowStats, Mo
 use photon_pointer_warp::domain::config::{
     effective_hud_style, normalize_thumbnail_dim, AppConfig, HudBackground,
 };
+use photon_pointer_warp::domain::hud_hit::HudHit;
 use photon_pointer_warp::domain::monitor_layout::clamp_to_monitors;
 use photon_pointer_warp::domain::settle::{decide_settle, policy_for, SettleDecision};
 use photon_pointer_warp::domain::shake::ShakeDetector;
@@ -24,12 +25,12 @@ use photon_pointer_warp::domain::tracking::{TrackingAction, TrackingController};
 use photon_pointer_warp::domain::trigger::{TriggerCoordinator, TriggerSource};
 use photon_pointer_warp::platform::calibrate_window::CALIBRATE_MUTEX_NAME;
 use photon_pointer_warp::platform::capture::{capture_thumbnails, ThumbnailLayer};
-use photon_pointer_warp::platform::layout::warp_target_for_cell;
+use photon_pointer_warp::platform::layout::{warp_target_for_cell, MINIMAP_GRID};
 use photon_pointer_warp::platform::monitors::{capture_display_snapshot, DisplaySnapshot};
 use photon_pointer_warp::platform::startup;
 use photon_pointer_warp::platform::tray::{
-    TrayEvent, TrayIcon, IDM_APPLY_SUGGESTION, IDM_CALIBRATE, IDM_DISMISS_SUGGESTION, IDM_EXIT,
-    IDM_PAUSE, IDM_STARTUP, IDM_TOGGLE_THUMBNAIL, WM_TRAYICON,
+    PopupAnchor, PopupMenu, TrayEvent, TrayIcon, IDM_APPLY_SUGGESTION, IDM_CALIBRATE,
+    IDM_DISMISS_SUGGESTION, IDM_EXIT, IDM_PAUSE, IDM_STARTUP, IDM_TOGGLE_THUMBNAIL, WM_TRAYICON,
 };
 use photon_pointer_warp::platform::window::HudOverlay;
 use windows::core::w;
@@ -170,6 +171,13 @@ struct AppState {
     hud_opened_at: Option<Instant>,
     hud_opened_cursor: Option<(i32, i32)>,
     feedback_circle_hud: bool,
+    posted_menu: Option<PostedMenu>,
+}
+
+#[derive(Clone, Copy)]
+enum PostedMenu {
+    Full { x: i32, y: i32 },
+    Suggestion { x: i32, y: i32 },
 }
 
 struct ThumbnailResult {
@@ -388,6 +396,7 @@ pub fn run(config: AppConfig) -> io::Result<()> {
                 hud_opened_at: None,
                 hud_opened_cursor: None,
                 feedback_circle_hud: false,
+                posted_menu: None,
             })
         });
 
@@ -472,7 +481,7 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_OPEN_ADJUST => {
             unsafe { foreground_menu_owner(hwnd) };
-            open_adjust_menu();
+            open_posted_menu();
             unsafe { restore_menu_owner(hwnd) };
             LRESULT(0)
         }
@@ -656,6 +665,11 @@ fn schedule_display_refresh(hwnd: HWND) {
 
 /// 幾何が変わって HUD を閉じたとき `true`。列挙が空のときは現状を維持する。
 fn refresh_display_if_stale(guard: &mut AppState) -> io::Result<bool> {
+    if let Some(tray) = guard.tray.as_mut() {
+        if let Err(err) = unsafe { tray.sync_small_icon_size() } {
+            eprintln!("[tray] icon: {err}");
+        }
+    }
     let fresh = capture_display_snapshot();
     if fresh.monitors.is_empty() || fresh == guard.display {
         return Ok(false);
@@ -702,11 +716,12 @@ unsafe fn restore_menu_owner(hwnd: HWND) {
     let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE.0 as isize);
 }
 
-fn open_adjust_menu() {
+fn open_posted_menu() {
     let prepared = {
         let Some(mut guard) = APP.get().and_then(|a| a.try_lock().ok()) else {
             return;
         };
+        let posted = guard.posted_menu.take();
         let Some(tray) = guard.tray.as_ref() else {
             spawn_calibrate(&mut guard);
             return;
@@ -716,13 +731,41 @@ fn open_adjust_menu() {
             guard.hud_background == HudBackground::Thumbnail,
             tray.hwnd(),
             guard.pending_suggestion.as_ref().map(|s| s.summary.clone()),
+            posted,
         ))
     };
-    let Some((paused, thumbnail_enabled, hwnd, suggestion)) = prepared else {
+    let Some((paused, thumbnail_enabled, hwnd, suggestion, posted)) = prepared else {
         return;
     };
-    let cmd_id =
-        unsafe { TrayIcon::track_menu(hwnd, paused, thumbnail_enabled, suggestion.as_deref()) };
+    let (kind, anchor) = match posted {
+        Some(PostedMenu::Full { x, y }) => (
+            PopupMenu::Full,
+            Some(PopupAnchor {
+                x,
+                y,
+                open_downward: true,
+            }),
+        ),
+        Some(PostedMenu::Suggestion { x, y }) => (
+            PopupMenu::SuggestionOnly,
+            Some(PopupAnchor {
+                x,
+                y,
+                open_downward: true,
+            }),
+        ),
+        None => (PopupMenu::Full, None),
+    };
+    let cmd_id = unsafe {
+        TrayIcon::track_menu(
+            hwnd,
+            paused,
+            thumbnail_enabled,
+            suggestion.as_deref(),
+            kind,
+            anchor,
+        )
+    };
     if cmd_id != 0 {
         handle_tray_command_sync(hwnd, cmd_id);
     }
@@ -833,7 +876,14 @@ fn handle_tray_callback(lparam: LPARAM) {
             };
 
             let cmd_id = unsafe {
-                TrayIcon::track_menu(hwnd, paused, thumbnail_enabled, suggestion.as_deref())
+                TrayIcon::track_menu(
+                    hwnd,
+                    paused,
+                    thumbnail_enabled,
+                    suggestion.as_deref(),
+                    PopupMenu::Full,
+                    None,
+                )
             };
             if cmd_id != 0 {
                 handle_tray_command_sync(hwnd, cmd_id);
@@ -1617,47 +1667,64 @@ fn handle_hud_left_button_up() {
     if !is_anchored(&guard) {
         return;
     }
-    if guard.hud.badge_contains(point.x, point.y) {
-        drop(guard);
-        let raw = MESSAGE_HWND.load(Ordering::Acquire);
-        if raw == 0 {
-            return;
-        }
-        let hwnd = HWND(raw as _);
-        // ボタンアップの処理中に開くと、その離した操作がメニュー外クリックになる。
-        unsafe { foreground_menu_owner(hwnd) };
-        dismiss_hud_with_log(HudCloseReason::OpenAdjust);
-        let posted = unsafe { PostMessageW(hwnd, WM_OPEN_ADJUST, WPARAM(0), LPARAM(0)) };
-        if posted.is_err() {
-            unsafe { restore_menu_owner(hwnd) };
-        }
-        return;
-    }
-    if guard.hud.origin_hit_test_screen(point.x, point.y) {
-        drop(guard);
-        dismiss_hud_with_log(HudCloseReason::OriginClick);
-        return;
-    }
-    if guard.hud.uses_monitor_map() {
-        if let Some((index, target)) = guard.hud.monitor_target_at_screen(point.x, point.y) {
+    let hit = guard.hud.hit_at(point.x, point.y);
+    match hit {
+        HudHit::HeaderLeft => {
+            let (x, y) = guard.hud.header_menu_anchor();
+            guard.posted_menu = Some(PostedMenu::Full { x, y });
             drop(guard);
-            warp_hud_to_point(target.0, target.1, format!("monitor {}", index + 1));
-            return;
+            post_hud_menu(HudCloseReason::OpenMenu);
         }
-        if guard.hud.screen_in_panel(point.x, point.y) {
-            return;
+        HudHit::Badge => {
+            let Some((x, y)) = guard.hud.badge_menu_anchor() else {
+                return;
+            };
+            guard.posted_menu = Some(PostedMenu::Suggestion { x, y });
+            drop(guard);
+            post_hud_menu(HudCloseReason::OpenAdjust);
         }
-        drop(guard);
-        dismiss_hud_with_log(HudCloseReason::OutsideClick);
+        HudHit::Origin => {
+            drop(guard);
+            dismiss_hud_with_log(HudCloseReason::OriginClick);
+        }
+        HudHit::Monitor { index, target } => {
+            let monitor_map = guard.hud.uses_monitor_map();
+            drop(guard);
+            if monitor_map {
+                warp_hud_to_point(target.x, target.y, format!("monitor {}", index + 1));
+            } else {
+                let col = index % MINIMAP_GRID;
+                let row = index / MINIMAP_GRID;
+                warp_hud_to_cell(col, row);
+            }
+        }
+        HudHit::PanelEmpty => {}
+        HudHit::Outside => {
+            drop(guard);
+            dismiss_hud_with_log(HudCloseReason::OutsideClick);
+        }
+    }
+}
+
+fn post_hud_menu(reason: HudCloseReason) {
+    let raw = MESSAGE_HWND.load(Ordering::Acquire);
+    if raw == 0 {
+        if let Some(mut guard) = APP.get().and_then(|a| a.try_lock().ok()) {
+            guard.posted_menu = None;
+        }
         return;
     }
-    if let Some((col, row)) = guard.hud.minimap_cell_at_screen(point.x, point.y) {
-        drop(guard);
-        warp_hud_to_cell(col, row);
-        return;
+    let hwnd = HWND(raw as _);
+    // ボタンアップの処理中に開くと、その離した操作がメニュー外クリックになる。
+    unsafe { foreground_menu_owner(hwnd) };
+    dismiss_hud_with_log(reason);
+    let posted = unsafe { PostMessageW(hwnd, WM_OPEN_ADJUST, WPARAM(0), LPARAM(0)) };
+    if posted.is_err() {
+        if let Some(mut guard) = APP.get().and_then(|a| a.try_lock().ok()) {
+            guard.posted_menu = None;
+        }
+        unsafe { restore_menu_owner(hwnd) };
     }
-    drop(guard);
-    dismiss_hud_with_log(HudCloseReason::OutsideClick);
 }
 
 unsafe extern "system" fn hud_wnd_proc(

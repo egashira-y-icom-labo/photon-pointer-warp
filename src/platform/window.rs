@@ -6,20 +6,24 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 use crate::domain::config::{
     effective_hud_style, normalize_thumbnail_dim, HudBackground, HudStyle,
 };
+use crate::domain::hud_hit::{self, HudHit};
 use crate::domain::monitor_layout::{panel_limits, sort_monitors, MinimapGeometry, Monitor, Rect};
 use crate::platform::capture::{CaptureRequest, ThumbnailLayer};
+use crate::platform::icon::signature_image;
 use crate::platform::layout::{
     anchor_panel_within, grid_pin_offsets, is_pointer_out_of_bounds, minimap_cell_at,
-    point_within_radius, PanelScreenRect, VirtualScreen, DISMISS_OUT_OF_BOUNDS_MARGIN_PX,
-    MINIMAP_CELL_PX, MINIMAP_GRID, MINIMAP_PANEL_PX, ORIGIN_CANCEL_RADIUS_PX,
+    point_within_radius, warp_target_for_cell, PanelScreenRect, VirtualScreen,
+    DISMISS_OUT_OF_BOUNDS_MARGIN_PX, MINIMAP_CELL_PX, MINIMAP_GRID, MINIMAP_PANEL_PX,
+    ORIGIN_CANCEL_RADIUS_PX,
 };
 use crate::platform::monitors::dpi_at_screen;
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateFontW, DeleteDC, DeleteObject, DrawTextW, SelectObject, SetBkMode,
-    SetTextColor, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER,
-    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HDC, HGDIOBJ, TRANSPARENT,
+    CreateCompatibleDC, CreateFontW, DeleteDC, DeleteObject, DrawTextW, GetDC, ReleaseDC,
+    SelectObject, SetBkMode, SetTextColor, ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER,
+    BI_RGB, DEFAULT_CHARSET, DIB_RGB_COLORS,     DT_CALCRECT, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HDC,
+    HGDIOBJ, TRANSPARENT,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -41,6 +45,9 @@ const PANEL_PAD_PX: i32 = 6;
 const PANEL_LONG_MAX_PX: i32 = 560;
 const BADGE_SIZE_PX: i32 = 20;
 const BADGE_MARGIN_PX: i32 = 5;
+const HEADER_PX_AT_96: i32 = 24;
+const HEADER_TEXT: &str = "Photon Pointer Warp";
+const HEADER_TEXT_SHORT: &str = "Photon";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HudMode {
@@ -61,6 +68,14 @@ struct MapCache {
     pixels: Vec<u8>,
     generation: u64,
     highlight: Option<usize>,
+}
+
+struct HeaderLabel {
+    font_px: i32,
+    text: String,
+    width: i32,
+    height: i32,
+    coverage: Vec<u8>,
 }
 const PIN_INNER_RADIUS: i32 = 4;
 const PIN_MID_RADIUS: i32 = 7;
@@ -151,6 +166,8 @@ pub struct HudOverlay {
     geometry: Option<MinimapGeometry>,
     panel_w: i32,
     panel_h: i32,
+    header_h: i32,
+    header_label: Option<HeaderLabel>,
     dpi: u32,
     map_generation: u64,
     monitor_hover: Option<MonitorHover>,
@@ -160,6 +177,9 @@ pub struct HudOverlay {
     /// 提案バッジの画面座標。提案がある固定中だけ Some。
     badge_rect: Option<RECT>,
     badge_hot: bool,
+    /// ヘッダー左のアイコンと文字。画面座標。ヘッダーがあるときだけ Some。
+    header_left_rect: Option<RECT>,
+    header_hot: bool,
     background: HudBackground,
     thumbnail_dim: f32,
     thumbnail: Option<ThumbnailLayer>,
@@ -229,6 +249,8 @@ impl HudOverlay {
             geometry: None,
             panel_w: MINIMAP_PANEL_PX,
             panel_h: MINIMAP_PANEL_PX,
+            header_h: 0,
+            header_label: None,
             dpi: 96,
             map_generation: 0,
             monitor_hover: None,
@@ -236,6 +258,8 @@ impl HudOverlay {
             last_panel_rect: None,
             badge_rect: None,
             badge_hot: false,
+            header_left_rect: None,
+            header_hot: false,
             background: HudBackground::Thumbnail,
             thumbnail_dim: 0.4,
             thumbnail: None,
@@ -273,6 +297,8 @@ impl HudOverlay {
         self.last_panel_rect = None;
         self.badge_rect = None;
         self.badge_hot = false;
+        self.header_left_rect = None;
+        self.header_hot = false;
         self.discard_thumbnail();
         self.hover_cell = None;
         self.monitor_hover = None;
@@ -353,22 +379,28 @@ impl HudOverlay {
         if effective == HudStyle::Grid {
             self.map_style = HudStyle::Grid;
             self.geometry = None;
+            self.header_h = 0;
             self.panel_w = MINIMAP_PANEL_PX;
             self.panel_h = MINIMAP_PANEL_PX;
+            self.refresh_header_left_rect();
             return;
         }
         let long_max =
             (PANEL_LONG_PX * self.dpi as i32 / 96).clamp(PANEL_LONG_PX, PANEL_LONG_MAX_PX);
         let short_min = (PANEL_SHORT_PX * self.dpi as i32 / 96).clamp(PANEL_SHORT_PX, long_max);
         let (max_w, max_h) = panel_limits(&self.monitors, long_max, short_min);
-        let geometry = MinimapGeometry::build(&self.monitors, max_w, max_h, PANEL_PAD_PX);
+        let header = header_height_px(self.dpi);
+        let geometry = MinimapGeometry::build(&self.monitors, max_w, max_h, PANEL_PAD_PX, header);
         if geometry.blocks.is_empty() {
             self.map_style = HudStyle::Grid;
             self.geometry = None;
+            self.header_h = 0;
             self.panel_w = MINIMAP_PANEL_PX;
             self.panel_h = MINIMAP_PANEL_PX;
+            self.refresh_header_left_rect();
             return;
         }
+        self.header_h = header;
         self.panel_w = geometry.panel_w;
         self.panel_h = geometry.panel_h;
         self.geometry = Some(geometry);
@@ -463,20 +495,62 @@ impl HudOverlay {
         self.map_cache = None;
     }
 
-    /// モニターブロック内のクリックを、その画面上の着地点へ解決する。
-    pub fn monitor_target_at_screen(
-        &self,
-        screen_x: i32,
-        screen_y: i32,
-    ) -> Option<(usize, (i32, i32))> {
-        if !self.uses_monitor_map()
-            || self.badge_contains(screen_x, screen_y)
-            || self.origin_hit_test_screen(screen_x, screen_y)
-        {
-            return None;
+    /// 画面上の点を、バッジ、ヘッダー左、原点、モニター、パネル内、外側の順で分類する。
+    pub fn hit_at(&self, screen_x: i32, screen_y: i32) -> HudHit {
+        let screen = hud_hit::Point {
+            x: screen_x,
+            y: screen_y,
+        };
+        hud_hit::classify_hud_hit(
+            screen,
+            hud_hit::HudHitRegions {
+                panel: Rect {
+                    left: self.panel_screen.left,
+                    top: self.panel_screen.top,
+                    right: self.panel_screen.right,
+                    bottom: self.panel_screen.bottom,
+                },
+                badge: self.badge_rect.map(rect_from_win),
+                header_left: self.header_left_rect.map(rect_from_win),
+                pin: hud_hit::Point {
+                    x: self.pin_screen.x,
+                    y: self.pin_screen.y,
+                },
+                origin_radius: ORIGIN_CANCEL_RADIUS_PX,
+                monitor: self.monitor_landing(screen_x, screen_y),
+            },
+        )
+    }
+
+    pub fn header_menu_anchor(&self) -> (i32, i32) {
+        (
+            self.panel_screen.left,
+            self.panel_screen.top + self.header_h.max(0),
+        )
+    }
+
+    pub fn badge_menu_anchor(&self) -> Option<(i32, i32)> {
+        self.badge_rect.map(|rect| (rect.left, rect.bottom))
+    }
+
+    fn monitor_landing(&self, screen_x: i32, screen_y: i32) -> Option<(usize, hud_hit::Point)> {
+        if self.uses_monitor_map() {
+            let local = self.panel_local(screen_x, screen_y)?;
+            let (index, target) = self.geometry.as_ref()?.hit(local)?;
+            return Some((
+                index,
+                hud_hit::Point {
+                    x: target.0,
+                    y: target.1,
+                },
+            ));
         }
-        let local = self.panel_local(screen_x, screen_y)?;
-        self.geometry.as_ref()?.hit(local)
+        let (col, row) = self.minimap_cell_at_screen(screen_x, screen_y)?;
+        let (x, y) = warp_target_for_cell(col, row, self.virtual_screen);
+        Some((
+            row * MINIMAP_GRID + col,
+            hud_hit::Point { x, y },
+        ))
     }
 
     pub fn screen_in_panel(&self, screen_x: i32, screen_y: i32) -> bool {
@@ -518,6 +592,7 @@ impl HudOverlay {
         self.suggestion_hint = None;
         self.badge_rect = None;
         self.badge_hot = false;
+        self.header_hot = false;
         self.place_at(cursor_pos);
         self.redraw()?;
         self.show_topmost()?;
@@ -550,7 +625,7 @@ impl HudOverlay {
         self.mode = HudMode::Anchored;
         self.suggestion_hint = hint.map(str::to_string);
         self.refresh_badge_rect();
-        self.hover_cell = self.hover_cell_for_screen(self.pin_screen.x, self.pin_screen.y);
+        self.apply_hover(self.pin_screen.x, self.pin_screen.y);
         self.redraw()
     }
 
@@ -569,6 +644,7 @@ impl HudOverlay {
             bottom: layout.panel_top + self.panel_h,
         };
         self.refresh_badge_rect();
+        self.refresh_header_left_rect();
     }
 
     fn refresh_badge_rect(&mut self) {
@@ -577,8 +653,17 @@ impl HudOverlay {
             self.badge_hot = false;
             return;
         }
-        let left = self.panel_screen.right - BADGE_MARGIN_PX - BADGE_SIZE_PX;
-        let top = self.panel_screen.top + BADGE_MARGIN_PX;
+        let (left, top) = if self.header_h >= BADGE_SIZE_PX {
+            (
+                self.panel_screen.right - 4 - BADGE_SIZE_PX,
+                self.panel_screen.top + (self.header_h - BADGE_SIZE_PX) / 2,
+            )
+        } else {
+            (
+                self.panel_screen.right - BADGE_MARGIN_PX - BADGE_SIZE_PX,
+                self.panel_screen.top + BADGE_MARGIN_PX,
+            )
+        };
         let right = left + BADGE_SIZE_PX;
         let bottom = top + BADGE_SIZE_PX;
         if left <= self.panel_screen.left + BADGE_MARGIN_PX || bottom >= self.panel_screen.bottom {
@@ -592,6 +677,50 @@ impl HudOverlay {
             right,
             bottom,
         });
+    }
+
+    fn refresh_header_left_rect(&mut self) {
+        let next = self.header_left_screen_rect();
+        if next.is_none() {
+            self.header_hot = false;
+        }
+        self.header_left_rect = next;
+    }
+
+    fn header_left_screen_rect(&self) -> Option<RECT> {
+        if self.header_h <= 0 {
+            return None;
+        }
+        let icon_px = if self.header_h >= 28 { 24 } else { 16 };
+        let inset = ((self.header_h - icon_px) / 2).max(2);
+        let text_w = self
+            .header_label
+            .as_ref()
+            .map(|label| label.width)
+            .unwrap_or(0);
+        let content_right = inset + icon_px + if text_w > 0 { 6 + text_w } else { 0 };
+        let mut right = self.panel_screen.left + content_right + 6;
+        let badge_stop = self.panel_screen.right - (BADGE_SIZE_PX + 8);
+        if right > badge_stop {
+            right = badge_stop;
+        }
+        if right <= self.panel_screen.left {
+            return None;
+        }
+        Some(RECT {
+            left: self.panel_screen.left,
+            top: self.panel_screen.top,
+            right,
+            bottom: self.panel_screen.top + self.header_h,
+        })
+    }
+
+    pub fn in_header(&self, screen_x: i32, screen_y: i32) -> bool {
+        if self.header_h <= 0 {
+            return false;
+        }
+        self.panel_local(screen_x, screen_y)
+            .is_some_and(|(_, y)| y < self.header_h)
     }
 
     pub fn badge_contains(&self, screen_x: i32, screen_y: i32) -> bool {
@@ -700,6 +829,8 @@ impl HudOverlay {
         self.suggestion_hint = None;
         self.badge_rect = None;
         self.badge_hot = false;
+        self.header_left_rect = None;
+        self.header_hot = false;
         self.discard_thumbnail();
         self.mode = HudMode::Anchored;
         clear_pixels(self.pixels, self.pixel_len);
@@ -748,57 +879,51 @@ impl HudOverlay {
         )
     }
 
-    fn hover_cell_for_screen(&self, screen_x: i32, screen_y: i32) -> Option<(usize, usize)> {
-        if self.badge_contains(screen_x, screen_y)
-            || self.origin_hit_test_screen(screen_x, screen_y)
-        {
-            return None;
+    pub fn update_hover_from_screen(&mut self, screen_x: i32, screen_y: i32) -> io::Result<()> {
+        let changed = self.apply_hover(screen_x, screen_y);
+        if changed {
+            self.redraw()?;
         }
-        self.minimap_cell_at_screen(screen_x, screen_y)
+        Ok(())
     }
 
-    pub fn update_hover_from_screen(&mut self, screen_x: i32, screen_y: i32) -> io::Result<()> {
-        let on_badge = self.badge_contains(screen_x, screen_y);
-        let next_monitor = if on_badge {
-            None
-        } else {
-            self.monitor_hover_at(screen_x, screen_y)
+    fn apply_hover(&mut self, screen_x: i32, screen_y: i32) -> bool {
+        let hit = self.hit_at(screen_x, screen_y);
+        let on_badge = matches!(hit, HudHit::Badge);
+        let on_header = matches!(hit, HudHit::HeaderLeft);
+        let next_monitor = match hit {
+            HudHit::Monitor { index, .. } if self.uses_monitor_map() => {
+                self.panel_local(screen_x, screen_y)
+                    .map(|(panel_x, panel_y)| MonitorHover {
+                        index,
+                        panel_x,
+                        panel_y,
+                    })
+            }
+            _ => None,
         };
-        let next_cell = if on_badge {
-            None
-        } else {
-            self.hover_cell_for_screen(screen_x, screen_y)
+        let next_cell = match hit {
+            HudHit::Monitor { index, .. } if !self.uses_monitor_map() => {
+                Some((index % MINIMAP_GRID, index / MINIMAP_GRID))
+            }
+            _ => None,
         };
         let hover_changed = if self.uses_monitor_map() {
             next_monitor != self.monitor_hover
         } else {
             next_cell != self.hover_cell
         };
-        if on_badge == self.badge_hot && !hover_changed {
-            return Ok(());
+        if on_badge == self.badge_hot && on_header == self.header_hot && !hover_changed {
+            return false;
         }
         self.badge_hot = on_badge;
+        self.header_hot = on_header;
         if self.uses_monitor_map() {
             self.monitor_hover = next_monitor;
         } else {
             self.hover_cell = next_cell;
         }
-        self.redraw()
-    }
-
-    fn monitor_hover_at(&self, screen_x: i32, screen_y: i32) -> Option<MonitorHover> {
-        if self.badge_contains(screen_x, screen_y)
-            || self.origin_hit_test_screen(screen_x, screen_y)
-        {
-            return None;
-        }
-        let local = self.panel_local(screen_x, screen_y)?;
-        let (index, _) = self.geometry.as_ref()?.hit(local)?;
-        Some(MonitorHover {
-            index,
-            panel_x: local.0,
-            panel_y: local.1,
-        })
+        true
     }
 
     fn panel_bounds_dib(&self) -> RECT {
@@ -835,6 +960,23 @@ impl HudOverlay {
                 self.panel_screen,
                 self.hover_cell,
             );
+        }
+        if self.header_hot {
+            if let Some(rect) = self.header_left_rect {
+                blend_rect_straight(
+                    self.pixels,
+                    self.virtual_screen.width,
+                    self.virtual_screen.height,
+                    rect.left - self.virtual_screen.x,
+                    rect.top - self.virtual_screen.y,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    230,
+                    240,
+                    255,
+                    48,
+                );
+            }
         }
         if let Some(rect) = self.badge_rect {
             draw_suggestion_badge(
@@ -1050,7 +1192,7 @@ impl HudOverlay {
                 cache.h,
             );
         }
-        if self.mode == HudMode::Anchored && !self.badge_hot {
+        if self.mode == HudMode::Anchored && !self.badge_hot && !self.header_hot {
             if let Some(hover) = self.monitor_hover {
                 draw_crosshair(
                     self.pixels,
@@ -1103,6 +1245,16 @@ impl HudOverlay {
             highlight,
         );
         unsafe { paint_monitor_labels(dib.dc, dib.pixels, w, h, &geometry.blocks) };
+        if self.header_h > 0 {
+            paint_header(
+                dib.pixels,
+                w,
+                h,
+                self.header_h,
+                &mut self.header_label,
+            );
+            self.refresh_header_left_rect();
+        }
         let mut pixels = vec![0u8; dib.len];
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -1121,6 +1273,328 @@ impl HudOverlay {
             highlight,
         });
         Ok(())
+    }
+}
+
+fn header_height_px(dpi: u32) -> i32 {
+    HEADER_PX_AT_96 * dpi.max(96) as i32 / 96
+}
+
+fn paint_header(
+    pixels: *mut u8,
+    width: i32,
+    height: i32,
+    header_h: i32,
+    cache: &mut Option<HeaderLabel>,
+) {
+    fill_rect_premul(
+        pixels, width, height, 0, 0, width, header_h, 18, 20, 26, 235,
+    );
+    if header_h > 1 {
+        fill_rect_premul(
+            pixels,
+            width,
+            height,
+            0,
+            header_h - 1,
+            width,
+            1,
+            70,
+            82,
+            102,
+            180,
+        );
+    }
+    let icon_px: u32 = if header_h >= 28 { 24 } else { 16 };
+    let inset = ((header_h - icon_px as i32) / 2).max(2);
+    if let Ok(icon) = signature_image(icon_px) {
+        blend_straight_bgra(
+            pixels,
+            width,
+            height,
+            inset,
+            inset,
+            &icon.bgra,
+            icon_px as i32,
+            icon_px as i32,
+        );
+    }
+    let text_left = inset + icon_px as i32 + 6;
+    let available = width - text_left - (BADGE_SIZE_PX + 8);
+    let font_px = (header_h * 5 / 8).clamp(11, 18);
+    let Some(text) = fitting_header_text(available, font_px, cache) else {
+        return;
+    };
+    let Some(label) = cached_header_label(cache, &text, font_px) else {
+        return;
+    };
+    let text_y = (header_h - label.height) / 2;
+    blend_coverage(
+        pixels,
+        width,
+        height,
+        text_left,
+        text_y,
+        label.width,
+        label.height,
+        &label.coverage,
+        200,
+        200,
+        200,
+        200,
+    );
+}
+
+fn fitting_header_text(
+    available: i32,
+    font_px: i32,
+    cache: &mut Option<HeaderLabel>,
+) -> Option<String> {
+    if available < 8 {
+        return None;
+    }
+    for text in [HEADER_TEXT, HEADER_TEXT_SHORT] {
+        let label = cached_header_label(cache, text, font_px)?;
+        if label.width <= available {
+            return Some(text.to_string());
+        }
+    }
+    None
+}
+
+fn cached_header_label<'a>(
+    cache: &'a mut Option<HeaderLabel>,
+    text: &str,
+    font_px: i32,
+) -> Option<&'a HeaderLabel> {
+    let matches = cache
+        .as_ref()
+        .is_some_and(|label| label.font_px == font_px && label.text == text);
+    if !matches {
+        let (width, height, coverage) = rasterize_label(text, font_px)?;
+        *cache = Some(HeaderLabel {
+            font_px,
+            text: text.to_string(),
+            width,
+            height,
+            coverage,
+        });
+    }
+    cache.as_ref()
+}
+
+fn rasterize_label(text: &str, font_px: i32) -> Option<(i32, i32, Vec<u8>)> {
+    unsafe {
+        let screen = GetDC(None);
+        if screen.is_invalid() {
+            return None;
+        }
+        let font = CreateFontW(
+            -font_px,
+            0,
+            0,
+            0,
+            FW_NORMAL.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            0,
+            0,
+            ANTIALIASED_QUALITY.0 as u32,
+            0,
+            w!("Segoe UI"),
+        );
+        if font.is_invalid() {
+            let _ = ReleaseDC(None, screen);
+            return None;
+        }
+        let old = SelectObject(screen, font);
+        let mut wide: Vec<u16> = text.encode_utf16().collect();
+        let mut measure = RECT::default();
+        SetBkMode(screen, TRANSPARENT);
+        let _ = DrawTextW(
+            screen,
+            &mut wide,
+            &mut measure,
+            DT_CALCRECT | DT_LEFT | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        let _ = SelectObject(screen, old);
+        let _ = DeleteObject(font);
+        let _ = ReleaseDC(None, screen);
+        let width = measure.right.max(1);
+        let height = measure.bottom.max(1);
+        let dib = create_dib_section(width, height).ok()?;
+        let font = CreateFontW(
+            -font_px,
+            0,
+            0,
+            0,
+            FW_NORMAL.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            0,
+            0,
+            ANTIALIASED_QUALITY.0 as u32,
+            0,
+            w!("Segoe UI"),
+        );
+        let old = SelectObject(dib.dc, font);
+        SetBkMode(dib.dc, TRANSPARENT);
+        SetTextColor(dib.dc, COLORREF(0x00FF_FFFF));
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        let _ = DrawTextW(
+            dib.dc,
+            &mut wide,
+            &mut rect,
+            DT_LEFT | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        let _ = SelectObject(dib.dc, old);
+        let _ = DeleteObject(font);
+        let mut coverage = vec![0u8; (width * height) as usize];
+        for index in 0..coverage.len() {
+            let px = dib.pixels.add(index * 4);
+            let b = *px;
+            let g = *px.add(1);
+            let r = *px.add(2);
+            coverage[index] = b.max(g).max(r);
+        }
+        discard_dib(dib);
+        Some((width, height, coverage))
+    }
+}
+
+fn blend_straight_bgra(
+    pixels: *mut u8,
+    dst_w: i32,
+    dst_h: i32,
+    dest_x: i32,
+    dest_y: i32,
+    src: &[u8],
+    src_w: i32,
+    src_h: i32,
+) {
+    for row in 0..src_h {
+        for col in 0..src_w {
+            let src_index = ((row * src_w + col) * 4) as usize;
+            if src_index + 3 >= src.len() {
+                continue;
+            }
+            blend_straight_pixel(
+                pixels,
+                dst_w,
+                dst_h,
+                dest_x + col,
+                dest_y + row,
+                src[src_index],
+                src[src_index + 1],
+                src[src_index + 2],
+                src[src_index + 3],
+            );
+        }
+    }
+}
+
+fn blend_coverage(
+    pixels: *mut u8,
+    dst_w: i32,
+    dst_h: i32,
+    dest_x: i32,
+    dest_y: i32,
+    src_w: i32,
+    src_h: i32,
+    coverage: &[u8],
+    r: u8,
+    g: u8,
+    b: u8,
+    alpha_scale: u8,
+) {
+    for row in 0..src_h {
+        for col in 0..src_w {
+            let index = (row * src_w + col) as usize;
+            let Some(mask) = coverage.get(index).copied() else {
+                continue;
+            };
+            let alpha = ((mask as u32 * alpha_scale as u32) / 255) as u8;
+            blend_straight_pixel(
+                pixels,
+                dst_w,
+                dst_h,
+                dest_x + col,
+                dest_y + row,
+                b,
+                g,
+                r,
+                alpha,
+            );
+        }
+    }
+}
+
+fn rect_from_win(rect: RECT) -> Rect {
+    Rect {
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+    }
+}
+
+fn blend_rect_straight(
+    pixels: *mut u8,
+    width: i32,
+    height: i32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    b: u8,
+    g: u8,
+    r: u8,
+    a: u8,
+) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    for dy in 0..h {
+        for dx in 0..w {
+            blend_straight_pixel(pixels, width, height, x + dx, y + dy, b, g, r, a);
+        }
+    }
+}
+
+fn blend_straight_pixel(
+    pixels: *mut u8,
+    width: i32,
+    height: i32,
+    x: i32,
+    y: i32,
+    b: u8,
+    g: u8,
+    r: u8,
+    a: u8,
+) {
+    if pixels.is_null() || x < 0 || y < 0 || x >= width || y >= height || a == 0 {
+        return;
+    }
+    let idx = ((y * width + x) * 4) as isize;
+    unsafe {
+        let p = pixels.offset(idx);
+        let inv = 255u32 - a as u32;
+        let blend = |src: u8, dst: u8| {
+            ((src as u32 * a as u32) / 255 + (dst as u32 * inv) / 255) as u8
+        };
+        *p = blend(b, *p);
+        *p.offset(1) = blend(g, *p.offset(1));
+        *p.offset(2) = blend(r, *p.offset(2));
+        *p.offset(3) = blend(255, *p.offset(3));
     }
 }
 
@@ -1266,16 +1740,35 @@ fn paint_monitor_blocks(
         let hot = highlight == Some(index);
         if let Some(thumbnail) = thumbnail {
             if let Some(image) = thumbnail.blocks().get(index) {
-                blit_premul(
-                    pixels,
-                    width,
-                    height,
-                    image.dest.left,
-                    image.dest.top,
-                    image.pixels(),
-                    image.dest.width(),
-                    image.dest.height(),
-                );
+                let src_w = image.width();
+                let src_h = image.height();
+                let dst_w = block.width();
+                let dst_h = block.height();
+                if src_w == dst_w && src_h == dst_h {
+                    blit_premul(
+                        pixels,
+                        width,
+                        height,
+                        block.left,
+                        block.top,
+                        image.pixels(),
+                        src_w,
+                        src_h,
+                    );
+                } else {
+                    blit_premul_nearest(
+                        pixels,
+                        width,
+                        height,
+                        block.left,
+                        block.top,
+                        dst_w,
+                        dst_h,
+                        image.pixels(),
+                        src_w,
+                        src_h,
+                    );
+                }
             }
         }
         if thumbnail.is_none() {
@@ -1512,6 +2005,59 @@ fn blit_premul(
     }
 }
 
+/// 保存画素を今のブロックサイズへ最近傍で拡縮する。画面の取り直しはしない。
+fn blit_premul_nearest(
+    dst: *mut u8,
+    dst_w: i32,
+    dst_h: i32,
+    dest_x: i32,
+    dest_y: i32,
+    out_w: i32,
+    out_h: i32,
+    src: &[u8],
+    src_w: i32,
+    src_h: i32,
+) {
+    if dst.is_null()
+        || dst_w <= 0
+        || dst_h <= 0
+        || out_w <= 0
+        || out_h <= 0
+        || src_w <= 0
+        || src_h <= 0
+    {
+        return;
+    }
+    for row in 0..out_h {
+        let y = dest_y + row;
+        if y < 0 || y >= dst_h {
+            continue;
+        }
+        let src_row = ((row as i64) * (src_h as i64) / (out_h as i64)) as i32;
+        let src_row = src_row.clamp(0, src_h - 1);
+        for col in 0..out_w {
+            let x = dest_x + col;
+            if x < 0 || x >= dst_w {
+                continue;
+            }
+            let src_col = ((col as i64) * (src_w as i64) / (out_w as i64)) as i32;
+            let src_col = src_col.clamp(0, src_w - 1);
+            let src_idx = ((src_row * src_w + src_col) * 4) as usize;
+            if src_idx + 3 >= src.len() {
+                continue;
+            }
+            let dst_idx = ((y * dst_w + x) * 4) as isize;
+            unsafe {
+                let p = dst.offset(dst_idx);
+                *p = src[src_idx];
+                *p.offset(1) = src[src_idx + 1];
+                *p.offset(2) = src[src_idx + 2];
+                *p.offset(3) = src[src_idx + 3];
+            }
+        }
+    }
+}
+
 fn draw_suggestion_badge(
     pixels: *mut u8,
     width: i32,
@@ -1692,5 +2238,73 @@ fn stroke_circle_premul(
                 set_pixel_premul(pixels, width, height, cx + dx, cy + dy, r, g, b, a);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::paint_monitor_blocks;
+    use crate::domain::monitor_layout::Rect;
+    use crate::platform::capture::ThumbnailLayer;
+
+    fn bgra(buf: &[u8], w: i32, x: i32, y: i32) -> [u8; 4] {
+        let i = ((y * w + x) * 4) as usize;
+        [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+    }
+
+    fn solid(b: u8, g: u8, r: u8) -> [u8; 4] {
+        [b, g, r, 225]
+    }
+
+    #[test]
+    fn equal_thumbnail_is_drawn_inside_the_live_block() {
+        let captured = Rect {
+            left: 0,
+            top: 0,
+            right: 3,
+            bottom: 3,
+        };
+        let mut pixels = vec![1u8; 3 * 3 * 4];
+        pixels[4 * 4..4 * 5].copy_from_slice(&solid(8, 0, 0));
+        let layer = ThumbnailLayer::from_captured(vec![(captured, pixels)]);
+        let block = Rect {
+            left: 4,
+            top: 4,
+            right: 7,
+            bottom: 7,
+        };
+        let mut canvas = vec![0u8; 10 * 10 * 4];
+        paint_monitor_blocks(canvas.as_mut_ptr(), 10, 10, &[block], Some(&layer), None);
+        assert_ne!(bgra(&canvas, 10, 1, 1), solid(8, 0, 0));
+        assert_eq!(bgra(&canvas, 10, 5, 5), solid(8, 0, 0));
+    }
+
+    #[test]
+    fn resized_thumbnail_fills_the_current_block() {
+        let captured = Rect {
+            left: 0,
+            top: 0,
+            right: 2,
+            bottom: 2,
+        };
+        let layer = ThumbnailLayer::from_captured(vec![(
+            captured,
+            vec![
+                10, 0, 0, 225, 0, 0, 20, 225, 0, 30, 0, 225, 40, 40, 40, 225,
+            ],
+        )]);
+        let block = Rect {
+            left: 2,
+            top: 2,
+            right: 6,
+            bottom: 6,
+        };
+        let mut canvas = vec![0u8; 8 * 8 * 4];
+        paint_monitor_blocks(canvas.as_mut_ptr(), 8, 8, &[block], Some(&layer), None);
+        assert_ne!(bgra(&canvas, 8, 0, 0), [10, 0, 0, 225]);
+        assert_eq!(bgra(&canvas, 8, 3, 3), [10, 0, 0, 225]);
+        assert_eq!(bgra(&canvas, 8, 4, 3), [0, 0, 20, 225]);
+        assert_eq!(bgra(&canvas, 8, 3, 4), [0, 30, 0, 225]);
+        assert_eq!(bgra(&canvas, 8, 4, 4), [40, 40, 40, 225]);
     }
 }

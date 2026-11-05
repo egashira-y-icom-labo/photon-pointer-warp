@@ -5,8 +5,8 @@ use std::io;
 use crate::domain::monitor_layout::Rect;
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
-    SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, COLORONCOLOR,
-    DIB_RGB_COLORS, HBITMAP, HDC, SRCCOPY,
+    SetBrushOrgEx, SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    DIB_RGB_COLORS, HALFTONE, HBITMAP, HDC, SRCCOPY,
 };
 
 /// パネル座標上のモニター 1 枚分。画素は上から下、premultiplied BGRA。
@@ -18,6 +18,16 @@ pub struct ThumbnailBlock {
 impl ThumbnailBlock {
     pub fn pixels(&self) -> &[u8] {
         &self.pixels
+    }
+
+    /// 保存画素の幅。キャプチャ時のブロック幅で、`dest` の幅と同じ。
+    pub fn width(&self) -> i32 {
+        self.dest.width()
+    }
+
+    /// 保存画素の高さ。キャプチャ時のブロック高さで、`dest` の高さと同じ。
+    pub fn height(&self) -> i32 {
+        self.dest.height()
     }
 }
 
@@ -33,6 +43,16 @@ pub struct ThumbnailLayer {
 }
 
 impl ThumbnailLayer {
+    #[cfg(test)]
+    pub fn from_captured(blocks: Vec<(Rect, Vec<u8>)>) -> Self {
+        Self {
+            blocks: blocks
+                .into_iter()
+                .map(|(dest, pixels)| ThumbnailBlock { dest, pixels })
+                .collect(),
+        }
+    }
+
     pub fn monitor_count(&self) -> usize {
         self.blocks.len()
     }
@@ -123,7 +143,9 @@ unsafe fn blit_monitor(
         }
     };
     let previous = SelectObject(mem, bitmap);
-    SetStretchBltMode(mem, COLORONCOLOR);
+    // HALFTONE は端の画素も拾う。直後にブラシ原点を戻さないと画像がずれる。
+    SetStretchBltMode(mem, HALFTONE);
+    let _ = SetBrushOrgEx(mem, 0, 0, None);
     let copied = StretchBlt(
         mem,
         0,

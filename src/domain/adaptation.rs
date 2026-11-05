@@ -77,6 +77,7 @@ pub enum HudCloseReason {
     TrackingTimeout,
     DisplayChanged,
     OpenAdjust,
+    OpenMenu,
 }
 
 impl HudCloseReason {
@@ -91,6 +92,7 @@ impl HudCloseReason {
             Self::TrackingTimeout => "tracking timeout",
             Self::DisplayChanged => "display changed",
             Self::OpenAdjust => "open adjust",
+            Self::OpenMenu => "open menu",
         }
     }
 
@@ -657,6 +659,18 @@ mod tests {
             1100,
             0.0,
             HudCloseReason::DisplayChanged
+        ));
+        assert!(!is_accidental_trigger(
+            1000,
+            1100,
+            0.0,
+            HudCloseReason::OpenAdjust
+        ));
+        assert!(!is_accidental_trigger(
+            1000,
+            1100,
+            0.0,
+            HudCloseReason::OpenMenu
         ));
     }
 }

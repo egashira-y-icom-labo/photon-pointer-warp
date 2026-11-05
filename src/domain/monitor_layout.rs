@@ -115,11 +115,19 @@ pub struct MinimapGeometry {
 }
 
 impl MinimapGeometry {
-    /// `max_w`×`max_h` の枠に、余白 `pad` を残して相似縮小し中央へ置く。
-    pub fn build(monitors: &[Monitor], max_w: i32, max_h: i32, pad: i32) -> Self {
+    /// `max_w`×`max_h` のマップ枠に、余白 `pad` を残して相似縮小し中央へ置く。
+    /// `header_height` はマップの上に足す余白で、ブロックと `screen_to_panel` の Y に入る。
+    pub fn build(
+        monitors: &[Monitor],
+        max_w: i32,
+        max_h: i32,
+        pad: i32,
+        header_height: i32,
+    ) -> Self {
         let max_w = max_w.max(1);
         let max_h = max_h.max(1);
         let pad = pad.max(0);
+        let header = header_height.max(0);
         let mut monitors: Vec<Monitor> = monitors
             .iter()
             .copied()
@@ -127,26 +135,26 @@ impl MinimapGeometry {
             .collect();
         sort_monitors(&mut monitors);
         if monitors.is_empty() || max_w <= pad * 2 || max_h <= pad * 2 {
-            return Self::empty(max_w, max_h);
+            return Self::empty(max_w, max_h + header);
         }
 
         let bbox = union_rects(monitors.iter().map(|monitor| monitor.rect));
         let bbox_w = bbox.width();
         let bbox_h = bbox.height();
         if bbox_w <= 0 || bbox_h <= 0 {
-            return Self::empty(max_w, max_h);
+            return Self::empty(max_w, max_h + header);
         }
         let inner_w = max_w - pad * 2;
         let inner_h = max_h - pad * 2;
         let scale = (inner_w as f64 / bbox_w as f64).min(inner_h as f64 / bbox_h as f64);
         if !scale.is_finite() || scale <= 0.0 {
-            return Self::empty(max_w, max_h);
+            return Self::empty(max_w, max_h + header);
         }
 
         let mapped_w = map_delta(bbox_w, scale);
         let mapped_h = map_delta(bbox_h, scale);
         let offset_x = pad + (inner_w - mapped_w).max(0) / 2;
-        let offset_y = pad + (inner_h - mapped_h).max(0) / 2;
+        let offset_y = header + pad + (inner_h - mapped_h).max(0) / 2;
         let blocks = monitors
             .iter()
             .map(|monitor| Rect {
@@ -159,7 +167,7 @@ impl MinimapGeometry {
 
         Self {
             panel_w: max_w,
-            panel_h: max_h,
+            panel_h: max_h + header,
             blocks,
             monitors,
             bbox,
@@ -365,7 +373,7 @@ mod tests {
     }
 
     fn assert_invariants(name: &str, monitors: &[Monitor], max_w: i32, max_h: i32, pad: i32) {
-        let geo = MinimapGeometry::build(monitors, max_w, max_h, pad);
+        let geo = MinimapGeometry::build(monitors, max_w, max_h, pad, 0);
         assert_eq!(geo.blocks.len(), geo.monitors.len(), "{name} count");
         assert!(geo.monitors.first().unwrap().is_primary, "{name} primary");
         let tolerance = geo.round_trip_tolerance_px();
@@ -465,20 +473,20 @@ mod tests {
 
     #[test]
     fn horizontal_neighbors_share_an_edge() {
-        let geo = MinimapGeometry::build(&side_by_side(), 180, 180, 8);
+        let geo = MinimapGeometry::build(&side_by_side(), 180, 180, 8, 0);
         assert_eq!(geo.blocks[0].right, geo.blocks[1].left);
         assert!(geo.blocks[0].width() > 0);
     }
 
     #[test]
     fn vertical_neighbors_share_an_edge() {
-        let geo = MinimapGeometry::build(&stacked(), 180, 180, 8);
+        let geo = MinimapGeometry::build(&stacked(), 180, 180, 8, 0);
         assert_eq!(geo.blocks[0].bottom, geo.blocks[1].top);
     }
 
     #[test]
     fn bottom_aligned_4k_and_fhd_share_the_vertical_edge() {
-        let geo = MinimapGeometry::build(&uhd_fhd_bottom(), 180, 180, 8);
+        let geo = MinimapGeometry::build(&uhd_fhd_bottom(), 180, 180, 8, 0);
         assert_eq!(geo.blocks[0].right, geo.blocks[1].left);
         assert_eq!(geo.blocks[0].bottom, geo.blocks[1].bottom);
         assert!(geo.blocks[1].top > geo.blocks[0].top);
@@ -486,7 +494,7 @@ mod tests {
 
     #[test]
     fn l_shape_shares_only_the_touching_edges() {
-        let geo = MinimapGeometry::build(&l_shape(), 180, 180, 8);
+        let geo = MinimapGeometry::build(&l_shape(), 180, 180, 8, 0);
         assert_eq!(geo.blocks[0].bottom, geo.blocks[1].top);
         assert_eq!(geo.blocks[1].right, geo.blocks[2].left);
         assert!(
@@ -497,7 +505,7 @@ mod tests {
     #[test]
     fn primary_stays_first_when_it_sits_on_the_right() {
         let monitors = vec![mon(0, 0, 1920, 1080, false), mon(1920, 0, 3840, 1080, true)];
-        let geo = MinimapGeometry::build(&monitors, 180, 180, 8);
+        let geo = MinimapGeometry::build(&monitors, 180, 180, 8, 0);
         assert!(geo.monitors[0].is_primary);
         assert_eq!(geo.monitors[0].rect.left, 1920);
         let center = geo.screen_to_panel((2880, 540));
@@ -506,7 +514,7 @@ mod tests {
 
     #[test]
     fn gap_above_the_lower_monitor_is_not_a_target() {
-        let geo = MinimapGeometry::build(&uhd_fhd_bottom(), 180, 180, 8);
+        let geo = MinimapGeometry::build(&uhd_fhd_bottom(), 180, 180, 8, 0);
         let gap = geo.screen_to_panel((4800, 200));
         assert!(geo.hit(gap).is_none());
         assert!(geo.hit((0, 0)).is_none());
@@ -515,12 +523,12 @@ mod tests {
 
     #[test]
     fn empty_and_tiny_panels_do_not_panic() {
-        let geo = MinimapGeometry::build(&[], 180, 180, 8);
+        let geo = MinimapGeometry::build(&[], 180, 180, 8, 0);
         assert!(geo.blocks.is_empty());
         assert!(geo.hit((10, 10)).is_none());
         assert_eq!(geo.screen_to_panel((10, 10)), (0, 0));
 
-        let tiny = MinimapGeometry::build(&fhd(), 4, 4, 4);
+        let tiny = MinimapGeometry::build(&fhd(), 4, 4, 4, 0);
         assert!(tiny.blocks.is_empty());
         assert!(tiny.hit((1, 1)).is_none());
     }
@@ -562,5 +570,49 @@ mod tests {
         let primary_below = mon(0, 21, 10, 31, true);
         let above = mon(0, 0, 10, 10, false);
         assert_eq!(clamp_to_monitors((5, 15), &[above, primary_below]), (5, 21));
+    }
+
+    #[test]
+    fn header_keeps_monitor_shape_and_round_trip_below_the_band() {
+        let monitors = side_by_side();
+        let plain = MinimapGeometry::build(&monitors, 280, 120, 6, 0);
+        let headed = MinimapGeometry::build(&monitors, 280, 120, 6, 24);
+        assert_eq!(headed.panel_w, plain.panel_w);
+        assert_eq!(headed.panel_h, plain.panel_h + 24);
+        assert_eq!(headed.blocks.len(), plain.blocks.len());
+        for (plain_block, block) in plain.blocks.iter().zip(&headed.blocks) {
+            assert_eq!(block.left, plain_block.left);
+            assert_eq!(block.right, plain_block.right);
+            assert_eq!(block.width(), plain_block.width());
+            assert_eq!(block.height(), plain_block.height());
+            assert_eq!(block.top, plain_block.top + 24);
+            assert_eq!(block.bottom, plain_block.bottom + 24);
+        }
+        for (index, monitor) in headed.monitors.iter().enumerate() {
+            let center = (
+                monitor.rect.left + monitor.rect.width() / 2,
+                monitor.rect.top + monitor.rect.height() / 2,
+            );
+            let pin = headed.screen_to_panel(center);
+            let (hit_index, back) = headed.hit(pin).unwrap();
+            let tolerance = headed.round_trip_tolerance_px();
+            assert_eq!(hit_index, index);
+            assert!(
+                (back.0 - center.0).abs() <= tolerance && (back.1 - center.1).abs() <= tolerance,
+                "round trip {center:?} -> {back:?} tol {tolerance}"
+            );
+            assert!(headed.blocks[index].contains(pin));
+            assert!(pin.1 >= 24);
+            assert!(headed.blocks[index].top >= 24);
+        }
+    }
+
+    #[test]
+    fn header_band_is_not_a_monitor_target() {
+        let geo = MinimapGeometry::build(&side_by_side(), 280, 120, 6, 24);
+        for x in [0, geo.panel_w / 2, geo.panel_w - 1] {
+            assert!(geo.hit((x, 0)).is_none(), "top {x}");
+            assert!(geo.hit((x, 23)).is_none(), "band {x}");
+        }
     }
 }
