@@ -1278,7 +1278,7 @@ fn paint_monitor_blocks(
                 );
             }
         }
-        if hot || thumbnail.is_none() {
+        if thumbnail.is_none() {
             let (r, g, b, a) = if hot {
                 (72, 132, 188, 130)
             } else {
