@@ -2,6 +2,7 @@ pub mod icon;
 pub mod i18n;
 pub mod layout;
 pub mod misc;
+pub mod operator;
 
 #[cfg(windows)]
 pub mod calibrate_window;

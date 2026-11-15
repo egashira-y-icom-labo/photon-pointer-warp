@@ -30,6 +30,7 @@ use photon_pointer_warp::platform::i18n;
 use photon_pointer_warp::platform::layout::{warp_target_for_cell, MINIMAP_GRID};
 use photon_pointer_warp::platform::misc::get_system_ui_language;
 use photon_pointer_warp::platform::monitors::{capture_display_snapshot, DisplaySnapshot};
+use photon_pointer_warp::platform::operator::{self, OPERATOR_EXE_ENV};
 use photon_pointer_warp::platform::startup;
 use photon_pointer_warp::platform::tray::{
     PopupAnchor, PopupMenu, TrayEvent, TrayIcon, IDM_APPLY_SUGGESTION, IDM_CALIBRATE,
@@ -165,6 +166,7 @@ struct AppState {
     calibrating: bool,
     tray: Option<TrayIcon>,
     calibrate_child: Option<Child>,
+    operator_child: Option<Child>,
     config_mtime: Option<SystemTime>,
     raw_motion_history: VecDeque<(i32, i32, u64)>,
     input_clock_ms: u64,
@@ -393,6 +395,7 @@ pub fn run(config: AppConfig) -> io::Result<()> {
                 calibrating: false,
                 tray: Some(tray),
                 calibrate_child: None,
+                operator_child: None,
                 config_mtime: config_file_mtime(),
                 raw_motion_history: VecDeque::new(),
                 input_clock_ms: 0,
@@ -811,6 +814,27 @@ fn spawn_calibrate(state: &mut AppState) {
     }
 }
 
+fn spawn_operator(state: &mut AppState) {
+    if let Some(child) = state.operator_child.as_mut() {
+        if matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+    }
+    state.operator_child = None;
+    let Some(exe) = operator::resolve_operator_exe_default() else {
+        eprintln!(
+            "Photon Operator not found. Set {OPERATOR_EXE_ENV} to photon-ui.exe, place it beside this exe, or build under C:\\projects\\photon-operator\\target\\{{release,debug}}."
+        );
+        return;
+    };
+    match Command::new(&exe).spawn() {
+        Ok(child) => {
+            state.operator_child = Some(child);
+        }
+        Err(e) => eprintln!("failed to launch Photon Operator ({}): {e}", exe.display()),
+    }
+}
+
 fn enter_calibrating(state: &mut AppState) {
     state.calibrating = true;
     state.hud_phase = HudPhase::Idle;
@@ -898,6 +922,8 @@ fn handle_tray_callback(lparam: LPARAM) {
                 )
             };
 
+            // WS_EX_NOACTIVATE のままだとメニューが即閉じる（HUD メニューと同じ対策）。
+            unsafe { foreground_menu_owner(hwnd) };
             let cmd_id = unsafe {
                 TrayIcon::track_menu(
                     hwnd,
@@ -910,13 +936,14 @@ fn handle_tray_callback(lparam: LPARAM) {
                     None,
                 )
             };
+            unsafe { restore_menu_owner(hwnd) };
             if cmd_id != 0 {
                 handle_tray_command_sync(hwnd, cmd_id);
             }
         }
-        Some(TrayEvent::OpenCalibrate) => {
+        Some(TrayEvent::OpenOperator) => {
             if let Some(mut guard) = APP.get().and_then(|a| a.try_lock().ok()) {
-                spawn_calibrate(&mut guard);
+                spawn_operator(&mut guard);
             }
         }
         None => {}

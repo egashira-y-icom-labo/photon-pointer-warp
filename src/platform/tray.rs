@@ -25,7 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, PostMessageW, SetForegroundWindow, TrackPopupMenuEx, HICON, MF_CHECKED,
     MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, SM_CXSMICON, TPM_BOTTOMALIGN,
     TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, WM_APP, WM_LBUTTONDBLCLK, WM_NULL,
+    TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, WM_APP, WM_LBUTTONUP, WM_NULL,
     WM_RBUTTONUP,
 };
 
@@ -220,7 +220,7 @@ impl TrayIcon {
     pub fn callback_event(lparam: LPARAM) -> Option<TrayEvent> {
         match lparam.0 as u32 {
             WM_RBUTTONUP => Some(TrayEvent::ContextMenu),
-            WM_LBUTTONDBLCLK => Some(TrayEvent::OpenCalibrate),
+            WM_LBUTTONUP => Some(TrayEvent::OpenOperator),
             _ => None,
         }
     }
@@ -267,7 +267,7 @@ impl Drop for TrayIcon {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayEvent {
     ContextMenu,
-    OpenCalibrate,
+    OpenOperator,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
