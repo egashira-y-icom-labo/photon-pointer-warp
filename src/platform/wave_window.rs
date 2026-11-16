@@ -14,12 +14,11 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, GetWindowLongPtrW, RegisterClassW, SetCursor, SetWindowDisplayAffinity,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, UpdateLayeredWindowIndirect, CS_HREDRAW,
-    CS_VREDRAW, GWL_EXSTYLE, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, UPDATELAYEREDWINDOWINFO,
-    WDA_EXCLUDEFROMCAPTURE, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, GetWindowLongPtrW, RegisterClassW, SetCursor, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, UpdateLayeredWindowIndirect, CS_HREDRAW, CS_VREDRAW, GWL_EXSTYLE, HWND_TOPMOST,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
+    SW_SHOWNOACTIVATE, ULW_ALPHA, UPDATELAYEREDWINDOWINFO, WNDCLASSW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 const WAVE_CLASS: windows::core::PCWSTR = w!("PhotonPointerWarpWave");
@@ -125,7 +124,8 @@ impl WaveOverlay {
         )
         .map_err(|e| io::Error::other(format!("CreateWindowExW wave: {e}")))?;
 
-        let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+        // 画面キャプチャ（Win+PrtScn / Snipping Tool）に波動演出を写すため
+        // WDA_EXCLUDEFROMCAPTURE は設定しない。
         WAVE_HWND.store(hwnd.0 as isize, Ordering::Release);
         SUPPRESS_OS_CURSOR.store(false, Ordering::Release);
 
