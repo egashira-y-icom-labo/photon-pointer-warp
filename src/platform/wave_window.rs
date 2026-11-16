@@ -3,7 +3,7 @@
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
-use crate::domain::wave::{WavePhaseKind, WaveSnapshot};
+use crate::domain::wave::{AimBounds, WavePhaseKind, WaveSnapshot};
 use crate::platform::layout::VirtualScreen;
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -47,6 +47,22 @@ const WHITE_R: u8 = 255;
 const WHITE_G: u8 = 255;
 const WHITE_B: u8 = 255;
 
+#[derive(Clone, Debug)]
+struct CrackSeg {
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+}
+
+#[derive(Clone, Debug)]
+struct CrackField {
+    key: (i32, i32, i32, i32, i32, i32),
+    primary: Vec<CrackSeg>,
+    secondary: Vec<CrackSeg>,
+    rings: Vec<CrackSeg>,
+}
+
 pub struct WaveOverlay {
     hwnd: HWND,
     vs: VirtualScreen,
@@ -57,6 +73,7 @@ pub struct WaveOverlay {
     dpi_scale: f32,
     /// 現在 `WS_EX_TRANSPARENT` が付いているか。
     hit_test_transparent: bool,
+    crack_cache: Option<CrackField>,
 }
 
 unsafe impl Send for WaveOverlay {}
@@ -149,6 +166,7 @@ impl WaveOverlay {
             active: false,
             dpi_scale: dpi / 96.0,
             hit_test_transparent: true,
+            crack_cache: None,
         })
     }
 
@@ -203,13 +221,14 @@ impl WaveOverlay {
 
         match snap.phase {
             WavePhaseKind::ImpactFlash => self.draw_impact_flash(snap),
+            WavePhaseKind::ImpactLingering => self.draw_impact_lingering(snap),
             WavePhaseKind::Converging => {
                 self.draw_converging(snap);
-                self.draw_telemetry(snap);
+                self.draw_telemetry(snap, None);
             }
             WavePhaseKind::Expanding | WavePhaseKind::Frozen => {
                 self.draw_wave_body(snap);
-                self.draw_telemetry(snap);
+                self.draw_telemetry(snap, None);
             }
             _ => self.draw_wave_body(snap),
         }
@@ -394,22 +413,38 @@ impl WaveOverlay {
         );
     }
 
-    unsafe fn draw_telemetry(&mut self, snap: &WaveSnapshot) {
-        let label = match snap.phase {
-            WavePhaseKind::Expanding => "SCANNING...",
-            WavePhaseKind::Frozen => "TARGET LOCKED",
-            WavePhaseKind::Converging => "ENGAGING",
-            _ => return,
+    unsafe fn draw_telemetry(&mut self, snap: &WaveSnapshot, status_override: Option<&str>) {
+        let label = if let Some(s) = status_override {
+            s
+        } else {
+            match snap.phase {
+                WavePhaseKind::Expanding => "SCANNING...",
+                WavePhaseKind::Frozen => "TARGET LOCKED",
+                WavePhaseKind::Converging => "ENGAGING",
+                WavePhaseKind::ImpactLingering => "[OPTICS DAMAGED]",
+                _ => return,
+            }
         };
-        let (ax, ay) = if snap.direction_locked {
+        let (ax, ay) = if snap.direction_locked
+            || matches!(
+                snap.phase,
+                WavePhaseKind::ImpactFlash | WavePhaseKind::ImpactLingering
+            ) {
             (snap.target_x, snap.target_y)
         } else {
             (snap.tip_x, snap.tip_y)
         };
-        let dx = ax - snap.origin_x;
-        let dy = ay - snap.origin_y;
-        let rng = dx.hypot(dy);
-        let azm = dy.atan2(dx).to_degrees();
+        // 残留／着弾は固定値（snapshot の radius / angle）
+        let (rng, azm) = if matches!(
+            snap.phase,
+            WavePhaseKind::ImpactFlash | WavePhaseKind::ImpactLingering
+        ) {
+            (snap.radius, snap.angle_rad.to_degrees())
+        } else {
+            let dx = ax - snap.origin_x;
+            let dy = ay - snap.origin_y;
+            (dx.hypot(dy), dy.atan2(dx).to_degrees())
+        };
         let lines = [
             label.to_string(),
             format!("RNG : {rng:06.1} PX"),
@@ -588,9 +623,20 @@ impl WaveOverlay {
             self.dpi_scale,
         );
 
-        // 射撃のみ：弾痕＋ガラスひび割れ
+        // 射撃のみ：フルスクリーンひび割れ＋弾痕
         if snap.is_shoot {
-            draw_bullet_cracks(
+            self.ensure_crack_field(snap);
+            if let Some(field) = self.crack_cache.as_ref() {
+                draw_crack_field(
+                    self.pixels,
+                    self.vs.width,
+                    self.vs.height,
+                    field,
+                    fade,
+                    self.dpi_scale,
+                );
+            }
+            draw_bullet_hole(
                 self.pixels,
                 self.vs.width,
                 self.vs.height,
@@ -599,35 +645,9 @@ impl WaveOverlay {
                 fade,
                 self.dpi_scale,
             );
-            let hole_a = ((fade * 255.0) as u8).max(40);
-            fill_disk(
-                self.pixels,
-                self.vs.width,
-                self.vs.height,
-                cx,
-                cy,
-                self.sx(7.0),
-                40,
-                20,
-                10,
-                ((fade * 180.0) as u8).max(30),
-            );
-            fill_disk(
-                self.pixels,
-                self.vs.width,
-                self.vs.height,
-                cx,
-                cy,
-                self.sx(4.5),
-                BASE_R,
-                BASE_G,
-                BASE_B,
-                hole_a,
-            );
         }
 
-        let ret_a_scale = fade;
-        if ret_a_scale > 0.08 {
+        if fade > 0.08 {
             draw_reticle(
                 self.pixels,
                 self.vs.width,
@@ -641,9 +661,74 @@ impl WaveOverlay {
         }
     }
 
+    unsafe fn draw_impact_lingering(&mut self, snap: &WaveSnapshot) {
+        self.ensure_crack_field(snap);
+        let cx = snap.target_x as i32 - self.vs.x;
+        let cy = snap.target_y as i32 - self.vs.y;
+        if let Some(field) = self.crack_cache.as_ref() {
+            draw_crack_field(
+                self.pixels,
+                self.vs.width,
+                self.vs.height,
+                field,
+                1.0,
+                self.dpi_scale,
+            );
+        }
+        draw_bullet_hole(
+            self.pixels,
+            self.vs.width,
+            self.vs.height,
+            cx,
+            cy,
+            1.0,
+            self.dpi_scale,
+        );
+        draw_broken_reticle(
+            self.pixels,
+            self.vs.width,
+            self.vs.height,
+            cx,
+            cy,
+            self.sx(20.0),
+            self.sx(2.5),
+            hash2(cx, cy),
+        );
+        self.draw_telemetry(snap, Some("[OPTICS DAMAGED]"));
+    }
+
+    fn ensure_crack_field(&mut self, snap: &WaveSnapshot) {
+        let clip = snap.clip.unwrap_or(AimBounds {
+            left: self.vs.x as f32,
+            top: self.vs.y as f32,
+            right: (self.vs.x + self.vs.width) as f32,
+            bottom: (self.vs.y + self.vs.height) as f32,
+        });
+        let cx = snap.target_x.round() as i32 - self.vs.x;
+        let cy = snap.target_y.round() as i32 - self.vs.y;
+        let left = clip.left.round() as i32 - self.vs.x;
+        let top = clip.top.round() as i32 - self.vs.y;
+        let right = clip.right.round() as i32 - self.vs.x;
+        let bottom = clip.bottom.round() as i32 - self.vs.y;
+        let key = (cx, cy, left, top, right, bottom);
+        if self.crack_cache.as_ref().is_some_and(|c| c.key == key) {
+            return;
+        }
+        self.crack_cache = Some(build_crack_field(
+            cx,
+            cy,
+            left,
+            top,
+            right,
+            bottom,
+            self.dpi_scale,
+        ));
+    }
+
     pub unsafe fn hide(&mut self) -> io::Result<()> {
         self.set_suppress_os_cursor(false);
         self.set_hit_test_transparent(true);
+        self.crack_cache = None;
         if self.active {
             let stride = (self.vs.width * 4) as usize;
             let total = stride * self.vs.height as usize;
@@ -1195,7 +1280,205 @@ fn draw_impact_sparks(
     }
 }
 
-fn draw_bullet_cracks(
+fn ray_rect_exit(ox: f32, oy: f32, ang: f32, left: f32, top: f32, right: f32, bottom: f32) -> (f32, f32) {
+    let dx = ang.cos();
+    let dy = ang.sin();
+    let mut t_hit = f32::INFINITY;
+    if dx.abs() > 1e-6 {
+        let t = if dx > 0.0 {
+            (right - 1.0 - ox) / dx
+        } else {
+            (left - ox) / dx
+        };
+        if t > 0.0 {
+            let y = oy + dy * t;
+            if y >= top && y <= bottom - 1.0 {
+                t_hit = t_hit.min(t);
+            }
+        }
+    }
+    if dy.abs() > 1e-6 {
+        let t = if dy > 0.0 {
+            (bottom - 1.0 - oy) / dy
+        } else {
+            (top - oy) / dy
+        };
+        if t > 0.0 {
+            let x = ox + dx * t;
+            if x >= left && x <= right - 1.0 {
+                t_hit = t_hit.min(t);
+            }
+        }
+    }
+    if !t_hit.is_finite() {
+        t_hit = 1.0;
+    }
+    (ox + dx * t_hit, oy + dy * t_hit)
+}
+
+fn build_crack_field(
+    cx: i32,
+    cy: i32,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    dpi: f32,
+) -> CrackField {
+    let mut rng = hash2(cx.wrapping_mul(3), cy.wrapping_mul(7) ^ 0xC1A5);
+    let rays = 9 + (next_u32(&mut rng) % 4) as i32; // 9..12
+    let mut primary = Vec::new();
+    let mut secondary = Vec::new();
+    let mut ends: Vec<(f32, f32, f32)> = Vec::new(); // x,y,ang
+
+    for i in 0..rays {
+        let ang = (i as f32 / rays as f32) * std::f32::consts::TAU
+            + (next_f32(&mut rng) - 0.5) * 0.35;
+        let (ex, ey) = ray_rect_exit(
+            cx as f32,
+            cy as f32,
+            ang,
+            left as f32,
+            top as f32,
+            right as f32,
+            bottom as f32,
+        );
+        let segs = 5 + (next_u32(&mut rng) % 4) as i32;
+        let mut prev_x = cx as f32;
+        let mut prev_y = cy as f32;
+        for s in 1..=segs {
+            let t = s as f32 / segs as f32;
+            let jag = (next_f32(&mut rng) - 0.5) * 14.0 * dpi * (1.0 - t * 0.3);
+            let px = -ang.sin();
+            let py = ang.cos();
+            let x = cx as f32 + (ex - cx as f32) * t + px * jag;
+            let y = cy as f32 + (ey - cy as f32) * t + py * jag;
+            let x = x.clamp(left as f32, (right - 1) as f32);
+            let y = y.clamp(top as f32, (bottom - 1) as f32);
+            primary.push(CrackSeg {
+                x0: prev_x.round() as i32,
+                y0: prev_y.round() as i32,
+                x1: x.round() as i32,
+                y1: y.round() as i32,
+            });
+            // 二次亀裂（途中から枝分かれ）
+            if s >= 2 && s < segs && next_f32(&mut rng) > 0.45 {
+                let bang = ang + (next_f32(&mut rng) - 0.5) * 1.2;
+                let blen = (18.0 + next_f32(&mut rng) * 40.0) * dpi;
+                let bx = x + bang.cos() * blen;
+                let by = y + bang.sin() * blen;
+                secondary.push(CrackSeg {
+                    x0: x.round() as i32,
+                    y0: y.round() as i32,
+                    x1: bx.clamp(left as f32, (right - 1) as f32).round() as i32,
+                    y1: by.clamp(top as f32, (bottom - 1) as f32).round() as i32,
+                });
+            }
+            prev_x = x;
+            prev_y = y;
+        }
+        ends.push((ex, ey, ang));
+    }
+
+    // 着弾点周辺のクモの巣リング（30〜180px）
+    let mut rings = Vec::new();
+    for ring in 0..5 {
+        let radius = (30.0 + ring as f32 * 30.0) * dpi;
+        for i in 0..ends.len() {
+            let a0 = ends[i].2 + (next_f32(&mut rng) - 0.5) * 0.08;
+            let a1 = ends[(i + 1) % ends.len()].2 + (next_f32(&mut rng) - 0.5) * 0.08;
+            if next_f32(&mut rng) < 0.3 {
+                continue;
+            }
+            let x0 = cx as f32 + a0.cos() * radius;
+            let y0 = cy as f32 + a0.sin() * radius;
+            let x1 = cx as f32 + a1.cos() * radius;
+            let y1 = cy as f32 + a1.sin() * radius;
+            if x0 < left as f32
+                || x1 < left as f32
+                || y0 < top as f32
+                || y1 < top as f32
+                || x0 >= right as f32
+                || x1 >= right as f32
+                || y0 >= bottom as f32
+                || y1 >= bottom as f32
+            {
+                continue;
+            }
+            rings.push(CrackSeg {
+                x0: x0.round() as i32,
+                y0: y0.round() as i32,
+                x1: x1.round() as i32,
+                y1: y1.round() as i32,
+            });
+        }
+    }
+
+    CrackField {
+        key: (cx, cy, left, top, right, bottom),
+        primary,
+        secondary,
+        rings,
+    }
+}
+
+fn stroke_glass_edge(
+    pixels: *mut u8,
+    w: i32,
+    h: i32,
+    seg: &CrackSeg,
+    fade: f32,
+    dpi: f32,
+) {
+    let a_shadow = ((fade * 200.0) as u8).max(20);
+    let a_hi = ((fade * 235.0) as u8).max(25);
+    let th = (1.2 * dpi).round().max(1.0) as i32;
+    // 1px ずらした黒影
+    stroke_thick_line(
+        pixels,
+        w,
+        h,
+        seg.x0 + 1,
+        seg.y0 + 1,
+        seg.x1 + 1,
+        seg.y1 + 1,
+        th + 1,
+        BASE_R,
+        BASE_G,
+        BASE_B,
+        a_shadow,
+    );
+    // アイスシアンのハイライト
+    stroke_thick_line(
+        pixels,
+        w,
+        h,
+        seg.x0,
+        seg.y0,
+        seg.x1,
+        seg.y1,
+        th,
+        210,
+        245,
+        255,
+        a_hi,
+    );
+}
+
+fn draw_crack_field(
+    pixels: *mut u8,
+    w: i32,
+    h: i32,
+    field: &CrackField,
+    fade: f32,
+    dpi: f32,
+) {
+    for seg in field.primary.iter().chain(field.secondary.iter()).chain(field.rings.iter()) {
+        stroke_glass_edge(pixels, w, h, seg, fade, dpi);
+    }
+}
+
+fn draw_bullet_hole(
     pixels: *mut u8,
     w: i32,
     h: i32,
@@ -1204,92 +1487,77 @@ fn draw_bullet_cracks(
     fade: f32,
     dpi: f32,
 ) {
-    let mut rng = hash2(cx.wrapping_mul(3), cy.wrapping_mul(7));
-    let rays = 8 + (next_u32(&mut rng) % 3) as i32; // 8..10
-    let a = ((fade * 230.0) as u8).max(25);
-    let mut ends: Vec<(i32, i32, f32)> = Vec::with_capacity(rays as usize);
+    let scorched = ((fade * 180.0) as u8).max(30);
+    let hole = ((fade * 255.0) as u8).max(40);
+    fill_disk(
+        pixels,
+        w,
+        h,
+        cx,
+        cy,
+        (7.0 * dpi).round() as i32,
+        45,
+        22,
+        12,
+        scorched,
+    );
+    fill_disk(
+        pixels,
+        w,
+        h,
+        cx,
+        cy,
+        (5.5 * dpi).round() as i32,
+        BASE_R,
+        BASE_G,
+        BASE_B,
+        hole,
+    );
+}
 
-    for i in 0..rays {
-        let ang = (i as f32 / rays as f32) * std::f32::consts::TAU
-            + (next_f32(&mut rng) - 0.5) * 0.4;
-        let len = (30.0 + next_f32(&mut rng) * 55.0) * dpi;
-        let mut x = cx as f32;
-        let mut y = cy as f32;
-        let segs = 3 + (next_u32(&mut rng) % 3) as i32;
-        let mut prev_x = x;
-        let mut prev_y = y;
-        for s in 1..=segs {
-            let t = s as f32 / segs as f32;
-            let jag = (next_f32(&mut rng) - 0.5) * 10.0 * dpi;
-            let px = -ang.sin();
-            let py = ang.cos();
-            x = cx as f32 + ang.cos() * len * t + px * jag;
-            y = cy as f32 + ang.sin() * len * t + py * jag;
-            stroke_thick_line(
-                pixels,
-                w,
-                h,
-                prev_x.round() as i32,
-                prev_y.round() as i32,
-                x.round() as i32,
-                y.round() as i32,
-                (1.5 * dpi).round().max(1.0) as i32 + 1,
-                BASE_R,
-                BASE_G,
-                BASE_B,
-                a,
-            );
-            stroke_thick_line(
-                pixels,
-                w,
-                h,
-                prev_x.round() as i32,
-                prev_y.round() as i32,
-                x.round() as i32,
-                y.round() as i32,
-                (1.2 * dpi).round().max(1.0) as i32,
-                220,
-                245,
-                255,
-                a,
-            );
-            prev_x = x;
-            prev_y = y;
-        }
-        ends.push((x.round() as i32, y.round() as i32, len));
-    }
-
-    // 同心円状の短い亀裂（放射線を繋ぐ）
-    for ring in 0..3 {
-        let frac = 0.28 + ring as f32 * 0.22;
-        for i in 0..ends.len() {
-            let (x0, y0, len0) = ends[i];
-            let (x1, y1, len1) = ends[(i + 1) % ends.len()];
-            let r0 = len0 * frac;
-            let r1 = len1 * frac;
-            let a0 = ((y0 - cy) as f32).atan2((x0 - cx) as f32);
-            let a1 = ((y1 - cy) as f32).atan2((x1 - cx) as f32);
-            let sx0 = cx as f32 + a0.cos() * r0;
-            let sy0 = cy as f32 + a0.sin() * r0;
-            let sx1 = cx as f32 + a1.cos() * r1;
-            let sy1 = cy as f32 + a1.sin() * r1;
-            // 短い弧の代わりに隣接点を結ぶ
-            if next_f32(&mut rng) > 0.25 {
-                stroke_thick_line(
-                    pixels,
-                    w,
-                    h,
-                    sx0.round() as i32,
-                    sy0.round() as i32,
-                    sx1.round() as i32,
-                    sy1.round() as i32,
-                    (1.0 * dpi).round().max(1.0) as i32,
-                    200,
-                    235,
-                    245,
-                    ((a as f32) * 0.75) as u8,
-                );
-            }
+fn draw_broken_reticle(
+    pixels: *mut u8,
+    w: i32,
+    h: i32,
+    cx: i32,
+    cy: i32,
+    size: i32,
+    core: i32,
+    seed: u32,
+) {
+    let mut rng = seed;
+    let half = size / 2;
+    let arm = size / 3;
+    let corners = [
+        (-1_i32, -1_i32),
+        (1, -1),
+        (-1, 1),
+        (1, 1),
+    ];
+    for (sx, sy) in corners {
+        let ox = ((next_f32(&mut rng) - 0.5) * 6.0).round() as i32;
+        let oy = ((next_f32(&mut rng) - 0.5) * 6.0).round() as i32;
+        let rot = (next_f32(&mut rng) - 0.5) * 0.55;
+        let x = cx + sx * half + ox;
+        let y = cy + sy * half + oy;
+        let hx = (arm as f32 * rot.cos()).round() as i32;
+        let hy = (arm as f32 * rot.sin()).round() as i32;
+        let vx = (-arm as f32 * rot.sin()).round() as i32;
+        let vy = (arm as f32 * rot.cos()).round() as i32;
+        let layers = [
+            (core + 3, BASE_R, BASE_G, BASE_B, 230u8),
+            (core, WHITE_R, WHITE_G, WHITE_B, 255u8),
+            (core - 1, CORE_ARROW_R, CORE_ARROW_G, CORE_ARROW_B, 240u8),
+        ];
+        for (th, r, g, b, a) in layers {
+            stroke_thick_line(pixels, w, h, x, y, x + sx * hx.abs().max(1) + hx / 2, y + hy / 3, th, r, g, b, a);
+            stroke_thick_line(pixels, w, h, x, y, x + vx / 3, y + sy * vy.abs().max(1) + vy / 2, th, r, g, b, a);
         }
     }
+    // ズレた中心十字
+    let cx2 = cx + ((next_f32(&mut rng) - 0.5) * 4.0).round() as i32;
+    let cy2 = cy + ((next_f32(&mut rng) - 0.5) * 4.0).round() as i32;
+    let cross = size / 5;
+    stroke_thick_line(pixels, w, h, cx2 - cross, cy2, cx2 + cross, cy2, core, CORE_ARROW_R, CORE_ARROW_G, CORE_ARROW_B, 200);
+    stroke_thick_line(pixels, w, h, cx2, cy2 - cross, cx2, cy2 + cross, core, CORE_ARROW_R, CORE_ARROW_G, CORE_ARROW_B, 200);
 }

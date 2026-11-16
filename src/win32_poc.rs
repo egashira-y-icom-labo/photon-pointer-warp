@@ -1136,6 +1136,8 @@ fn sync_wave_hook_flags(state: &AppState) {
     let passthrough = state.detection_paused || state.calibrating || map_busy;
     MouseLlHook::set_passthrough(passthrough);
     let kind = state.wave.phase_kind();
+    let lingering = state.wave.is_lingering();
+    // 残留中も中ボタンで新規 Arming できるよう消費は続ける
     let wave_on = state.wave.is_active();
     MouseLlHook::set_consume_middle(wave_on);
     MouseLlHook::set_ignore_wheel(matches!(
@@ -1147,6 +1149,7 @@ fn sync_wave_hook_flags(state: &AppState) {
             | WavePhaseKind::CancelRewind
     ));
     MouseLlHook::set_forward_wheel(matches!(kind, WavePhaseKind::Frozen));
+    MouseLlHook::set_linger_watch(lingering);
 }
 
 fn handle_wave_hook(wparam: WPARAM, lparam: LPARAM) {
@@ -1207,8 +1210,16 @@ fn tick_wave_session() {
     }
     let now = Instant::now();
     let clock = mono_ms(guard.clock_origin, now);
-    let max_r = wave_max_radius(&guard);
-    let signal = guard.wave.on_tick(clock, max_r);
+    let mut signal = WaveSignal::None;
+    if guard.wave.is_lingering() {
+        let mut point = windows::Win32::Foundation::POINT::default();
+        if unsafe { GetCursorPos(&mut point) }.is_ok() {
+            signal = guard.wave.on_cursor_sample(point.x as f32, point.y as f32);
+        }
+    } else {
+        let max_r = wave_max_radius(&guard);
+        signal = guard.wave.on_tick(clock, max_r);
+    }
     handle_wave_signal(&mut guard, signal, now);
     sync_wave_hook_flags(&guard);
     let _ = present_wave_overlay(&mut guard);
@@ -1353,6 +1364,10 @@ fn handle_wave_signal(state: &mut AppState, signal: WaveSignal, now: Instant) {
                 inject_left_click();
             }
         }
+        WaveSignal::Linger => {
+            set_wave_cursor_capture(state, false, None);
+            eprintln!("[wave] linger optics damaged");
+        }
         WaveSignal::Finished => {
             state.wave_finish_shoot = false;
             state.wave_finish_target = None;
@@ -1386,8 +1401,11 @@ fn present_wave_overlay(state: &mut AppState) -> io::Result<()> {
         ) {
             let _ = unsafe { SetCursorPos(snap.origin_x as i32, snap.origin_y as i32) };
         }
-        // ImpactFlash 中は射撃済みのため透過を維持（念のため再適用）
-        if matches!(snap.phase, WavePhaseKind::ImpactFlash) {
+        // 着弾フラッシュ／残留中は透過を維持（背後操作・射撃クリック用）
+        if matches!(
+            snap.phase,
+            WavePhaseKind::ImpactFlash | WavePhaseKind::ImpactLingering
+        ) {
             set_wave_cursor_capture(state, false, None);
         }
         unsafe { state.wave_overlay.present_snapshot(&snap) }
@@ -1565,6 +1583,13 @@ fn open_hud_after_settle(
     source: TriggerSource,
     is_learning_target: bool,
 ) -> io::Result<()> {
+    // マップ HUD 起動時は射撃残留を必ず解除
+    if guard.wave.is_lingering() {
+        set_wave_cursor_capture(guard, false, None);
+        let _ = unsafe { guard.wave_overlay.hide() };
+        guard.wave.reset();
+        clear_consume_flags();
+    }
     let _ = refresh_display_if_stale(guard)?;
     bind_hud_map(guard);
     let message_hwnd = HWND(MESSAGE_HWND.load(Ordering::Acquire) as _);
@@ -1702,12 +1727,12 @@ unsafe fn handle_wm_input(lparam: LPARAM) -> io::Result<()> {
         push_motion_history(&mut guard, dx, dy, dt_millis);
     }
 
-    if guard.wave.is_active() {
+    if guard.wave.is_active() && !guard.wave.is_lingering() {
         let clock = mono_ms(guard.clock_origin, now);
         let signal = guard.wave.on_relative_move(dx, dy, clock);
         handle_wave_signal(&mut guard, signal, now);
         if guard.wave.is_active() {
-            // 波動中はマップジェスチャを抑止
+            // 波動中はマップジェスチャを抑止（残留中は除く）
             guard.coordinator.reset();
             return Ok(());
         }

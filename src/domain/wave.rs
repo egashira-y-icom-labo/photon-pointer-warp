@@ -23,9 +23,11 @@ pub const RADIUS_ADJUST_PX_PER_MS: f32 = 0.45;
 /// 収束アニメ時間。
 pub const CONVERGE_MS: f32 = 180.0;
 /// 着弾フラッシュ時間（衝撃波・スパークを視認できる長さ）。
-pub const IMPACT_FLASH_MS: f32 = 380.0;
+pub const IMPACT_FLASH_MS: f32 = 350.0;
 /// マップ昇華時に対角距離へ足す余裕。
 pub const ASCEND_RADIUS_PADDING_PX: f32 = 40.0;
+/// 射撃残留をカーソル移動で解除する距離。
+pub const LINGER_DISMISS_DIST_PX: f32 = 36.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AimBounds {
@@ -60,6 +62,7 @@ pub struct WaveConfig {
     pub converge_ms: f32,
     pub impact_flash_ms: f32,
     pub ascend_radius_padding_px: f32,
+    pub linger_dismiss_dist_px: f32,
 }
 
 impl Default for WaveConfig {
@@ -76,6 +79,7 @@ impl Default for WaveConfig {
             converge_ms: CONVERGE_MS,
             impact_flash_ms: IMPACT_FLASH_MS,
             ascend_radius_padding_px: ASCEND_RADIUS_PADDING_PX,
+            linger_dismiss_dist_px: LINGER_DISMISS_DIST_PX,
         }
     }
 }
@@ -88,6 +92,8 @@ pub enum WavePhaseKind {
     Frozen,
     Converging,
     ImpactFlash,
+    /// 射撃後のガラスひび割れ残留（背後操作可）。
+    ImpactLingering,
     CancelRewind,
 }
 
@@ -103,6 +109,8 @@ pub enum WaveSignal {
     ConvergeWarp,
     CancelRewind,
     Impact,
+    /// 射撃フラッシュ完了後、残留オーバーレイへ。
+    Linger,
     Finished,
 }
 
@@ -130,8 +138,10 @@ pub struct WaveSnapshot {
     pub selected_rank: usize,
     pub ranked_ids: Vec<u64>,
     pub progress: f32,
-    /// 左クリック射撃経路（ImpactFlash の弾痕演出用）。WARP は false。
+    /// 左クリック射撃経路（ImpactFlash / ImpactLingering 用）。WARP は false。
     pub is_shoot: bool,
+    /// ひび割れクリップ用のモニター境界（なければ None）。
+    pub clip: Option<AimBounds>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -181,12 +191,24 @@ enum Phase {
         progress: f32,
     },
     ImpactFlash {
-        x: f32,
-        y: f32,
+        impact_x: f32,
+        impact_y: f32,
+        origin_x: f32,
+        origin_y: f32,
+        radius: f32,
+        angle_rad: f32,
         shoot: bool,
         started_ms: u64,
         last_ms: u64,
         progress: f32,
+    },
+    ImpactLingering {
+        impact_x: f32,
+        impact_y: f32,
+        origin_x: f32,
+        origin_y: f32,
+        radius: f32,
+        angle_rad: f32,
     },
     CancelRewind {
         origin_x: f32,
@@ -230,12 +252,17 @@ impl WaveController {
             Phase::Frozen { .. } => WavePhaseKind::Frozen,
             Phase::Converging { .. } => WavePhaseKind::Converging,
             Phase::ImpactFlash { .. } => WavePhaseKind::ImpactFlash,
+            Phase::ImpactLingering { .. } => WavePhaseKind::ImpactLingering,
             Phase::CancelRewind { .. } => WavePhaseKind::CancelRewind,
         }
     }
 
     pub fn is_active(&self) -> bool {
         !matches!(self.phase, Phase::Idle)
+    }
+
+    pub fn is_lingering(&self) -> bool {
+        matches!(self.phase, Phase::ImpactLingering { .. })
     }
 
     pub fn ignores_wheel(&self) -> bool {
@@ -277,6 +304,7 @@ impl WaveController {
 
     pub fn snapshot(&self) -> WaveSnapshot {
         let ranked = self.ranked_ids();
+        let clip = self.aim_bounds;
         match &self.phase {
             Phase::Idle => empty_snap(ranked),
             Phase::Arming {
@@ -289,6 +317,7 @@ impl WaveController {
                 origin_y: *origin_y,
                 tip_x: *origin_x,
                 tip_y: *origin_y,
+                clip,
                 ..empty_snap(ranked)
             },
             Phase::Expanding {
@@ -358,6 +387,7 @@ impl WaveController {
                     ranked_ids: ranked,
                     progress,
                     is_shoot: false,
+                    clip,
                 }
             }
             Phase::Converging {
@@ -394,25 +424,56 @@ impl WaveController {
                     ranked_ids: ranked,
                     progress: *progress,
                     is_shoot: *shoot,
+                    clip,
                 }
             }
             Phase::ImpactFlash {
-                x,
-                y,
+                impact_x,
+                impact_y,
+                origin_x,
+                origin_y,
+                radius,
+                angle_rad,
                 shoot,
                 progress,
                 ..
             } => WaveSnapshot {
                 phase: WavePhaseKind::ImpactFlash,
-                origin_x: *x,
-                origin_y: *y,
-                tip_x: *x,
-                tip_y: *y,
-                target_x: *x,
-                target_y: *y,
+                origin_x: *origin_x,
+                origin_y: *origin_y,
+                radius: *radius,
+                angle_rad: *angle_rad,
                 direction_locked: true,
+                tip_x: *impact_x,
+                tip_y: *impact_y,
+                target_x: *impact_x,
+                target_y: *impact_y,
                 progress: *progress,
                 is_shoot: *shoot,
+                clip,
+                ..empty_snap(ranked)
+            },
+            Phase::ImpactLingering {
+                impact_x,
+                impact_y,
+                origin_x,
+                origin_y,
+                radius,
+                angle_rad,
+            } => WaveSnapshot {
+                phase: WavePhaseKind::ImpactLingering,
+                origin_x: *origin_x,
+                origin_y: *origin_y,
+                radius: *radius,
+                angle_rad: *angle_rad,
+                direction_locked: true,
+                tip_x: *impact_x,
+                tip_y: *impact_y,
+                target_x: *impact_x,
+                target_y: *impact_y,
+                progress: 1.0,
+                is_shoot: true,
+                clip,
                 ..empty_snap(ranked)
             },
         }
@@ -422,9 +483,9 @@ impl WaveController {
         let s = self.snapshot();
         match s.phase {
             WavePhaseKind::Idle | WavePhaseKind::Arming => None,
-            WavePhaseKind::ImpactFlash | WavePhaseKind::Converging => {
-                Some((s.target_x, s.target_y))
-            }
+            WavePhaseKind::ImpactFlash
+            | WavePhaseKind::ImpactLingering
+            | WavePhaseKind::Converging => Some((s.target_x, s.target_y)),
             _ if s.direction_locked && s.radius > 0.0 => Some((s.target_x, s.target_y)),
             _ => None,
         }
@@ -438,7 +499,10 @@ impl WaveController {
 
     fn ranked_ids(&self) -> Vec<u64> {
         match &self.phase {
-            Phase::Idle | Phase::Arming { .. } | Phase::ImpactFlash { .. } => Vec::new(),
+            Phase::Idle
+            | Phase::Arming { .. }
+            | Phase::ImpactFlash { .. }
+            | Phase::ImpactLingering { .. } => Vec::new(),
             Phase::Expanding {
                 origin_x,
                 origin_y,
@@ -493,6 +557,10 @@ impl WaveController {
     }
 
     pub fn on_middle_down(&mut self, x: f32, y: f32, clock_ms: u64) -> WaveSignal {
+        // 残留中の新規波動起動は残留を破棄してから Arming
+        if matches!(self.phase, Phase::ImpactLingering { .. }) {
+            self.phase = Phase::Idle;
+        }
         if !matches!(self.phase, Phase::Idle) {
             return WaveSignal::None;
         }
@@ -622,6 +690,10 @@ impl WaveController {
     }
 
     pub fn on_left_click(&mut self, clock_ms: u64) -> WaveSignal {
+        if matches!(self.phase, Phase::ImpactLingering { .. }) {
+            self.phase = Phase::Idle;
+            return WaveSignal::Finished;
+        }
         if matches!(self.phase, Phase::Frozen { .. }) {
             self.begin_converge(clock_ms, true)
         } else {
@@ -630,6 +702,10 @@ impl WaveController {
     }
 
     pub fn on_right_click(&mut self, clock_ms: u64) -> WaveSignal {
+        if matches!(self.phase, Phase::ImpactLingering { .. }) {
+            self.phase = Phase::Idle;
+            return WaveSignal::Finished;
+        }
         match self.phase {
             Phase::Expanding {
                 origin_x,
@@ -737,6 +813,11 @@ impl WaveController {
                 shoot,
                 target_x,
                 target_y,
+                origin_x,
+                origin_y,
+                radius,
+                tip_x,
+                tip_y,
                 ..
             } => {
                 let dt = clock_ms.saturating_sub(*last_ms) as f32;
@@ -744,11 +825,35 @@ impl WaveController {
                 *progress = (*progress + dt / self.config.converge_ms).min(1.0);
                 if *progress >= 1.0 {
                     let shoot = *shoot;
-                    let x = *target_x;
-                    let y = *target_y;
+                    let impact_x = *target_x;
+                    let impact_y = *target_y;
+                    let origin_x = *origin_x;
+                    let origin_y = *origin_y;
+                    let radius = *radius;
+                    let tip_x = *tip_x;
+                    let tip_y = *tip_y;
+                    let (_, angle_fallback) = pointer_heading(
+                        origin_x,
+                        origin_y,
+                        tip_x,
+                        tip_y,
+                        self.config.pointer_deadzone_px,
+                    );
+                    // tip がデッドゾーン内でも着弾方位は原点→着弾で固定
+                    let angle_rad = if (impact_x - origin_x).hypot(impact_y - origin_y) > 0.5 {
+                        (impact_y - origin_y)
+                            .atan2(impact_x - origin_x)
+                            .rem_euclid(TAU)
+                    } else {
+                        angle_fallback
+                    };
                     self.phase = Phase::ImpactFlash {
-                        x,
-                        y,
+                        impact_x,
+                        impact_y,
+                        origin_x,
+                        origin_y,
+                        radius,
+                        angle_rad,
                         shoot,
                         started_ms: clock_ms,
                         last_ms: clock_ms,
@@ -760,16 +865,35 @@ impl WaveController {
             Phase::ImpactFlash {
                 last_ms,
                 progress,
+                shoot,
+                impact_x,
+                impact_y,
+                origin_x,
+                origin_y,
+                radius,
+                angle_rad,
                 ..
             } => {
                 let dt = clock_ms.saturating_sub(*last_ms) as f32;
                 *last_ms = clock_ms;
                 *progress = (*progress + dt / self.config.impact_flash_ms).min(1.0);
                 if *progress >= 1.0 {
+                    if *shoot {
+                        self.phase = Phase::ImpactLingering {
+                            impact_x: *impact_x,
+                            impact_y: *impact_y,
+                            origin_x: *origin_x,
+                            origin_y: *origin_y,
+                            radius: *radius,
+                            angle_rad: *angle_rad,
+                        };
+                        return WaveSignal::Linger;
+                    }
                     self.phase = Phase::Idle;
                     return WaveSignal::Finished;
                 }
             }
+            Phase::ImpactLingering { .. } => {}
             Phase::CancelRewind {
                 last_ms,
                 progress,
@@ -793,6 +917,23 @@ impl WaveController {
     pub fn reset(&mut self) {
         self.phase = Phase::Idle;
         self.candidates.clear();
+    }
+
+    /// 残留中にカーソル絶対座標を渡し、離れすぎたら解除。
+    pub fn on_cursor_sample(&mut self, x: f32, y: f32) -> WaveSignal {
+        let Phase::ImpactLingering {
+            impact_x, impact_y, ..
+        } = self.phase
+        else {
+            return WaveSignal::None;
+        };
+        let dist = (x - impact_x).hypot(y - impact_y);
+        if dist >= self.config.linger_dismiss_dist_px {
+            self.phase = Phase::Idle;
+            WaveSignal::Finished
+        } else {
+            WaveSignal::None
+        }
     }
 
     fn begin_converge(&mut self, clock_ms: u64, shoot: bool) -> WaveSignal {
@@ -872,6 +1013,7 @@ fn empty_snap(ranked: Vec<u64>) -> WaveSnapshot {
         ranked_ids: ranked,
         progress: 0.0,
         is_shoot: false,
+        clip: None,
     }
 }
 
@@ -1048,7 +1190,7 @@ mod tests {
     }
 
     #[test]
-    fn shoot_path_marks_is_shoot_on_impact() {
+    fn shoot_path_lingers_then_dismisses_on_click() {
         let mut w = WaveController::new(WaveConfig {
             converge_ms: 80.0,
             impact_flash_ms: 40.0,
@@ -1065,10 +1207,45 @@ mod tests {
         w.on_relative_move(40.0, 0.0, 140);
         w.on_middle_up(150);
         assert_eq!(w.on_left_click(200), WaveSignal::ConvergeShoot);
-        assert!(w.snapshot().is_shoot);
         assert_eq!(w.on_tick(300, 800.0), WaveSignal::Impact);
-        assert!(w.snapshot().is_shoot);
         assert_eq!(w.snapshot().phase, WavePhaseKind::ImpactFlash);
+        assert!(w.snapshot().is_shoot);
+        assert_eq!(w.on_tick(360, 800.0), WaveSignal::Linger);
+        assert_eq!(w.snapshot().phase, WavePhaseKind::ImpactLingering);
+        assert_eq!(w.on_left_click(400), WaveSignal::Finished);
+        assert_eq!(w.phase_kind(), WavePhaseKind::Idle);
+    }
+
+    #[test]
+    fn linger_dismisses_when_cursor_leaves() {
+        let mut w = WaveController::new(WaveConfig {
+            converge_ms: 40.0,
+            impact_flash_ms: 20.0,
+            linger_dismiss_dist_px: 36.0,
+            ..WaveConfig::default()
+        });
+        w.set_aim_bounds(AimBounds {
+            left: 0.0,
+            top: 0.0,
+            right: 800.0,
+            bottom: 600.0,
+        });
+        w.on_middle_down(100.0, 100.0, 0);
+        w.on_tick(130, 800.0);
+        w.on_relative_move(40.0, 0.0, 140);
+        w.on_middle_up(150);
+        w.on_left_click(160);
+        assert_eq!(w.on_tick(220, 800.0), WaveSignal::Impact);
+        assert_eq!(w.on_tick(260, 800.0), WaveSignal::Linger);
+        let impact = w.snapshot();
+        assert_eq!(
+            w.on_cursor_sample(impact.target_x + 10.0, impact.target_y),
+            WaveSignal::None
+        );
+        assert_eq!(
+            w.on_cursor_sample(impact.target_x + 40.0, impact.target_y),
+            WaveSignal::Finished
+        );
     }
 
     #[test]

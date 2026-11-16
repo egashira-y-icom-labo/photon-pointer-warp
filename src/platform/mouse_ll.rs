@@ -60,6 +60,8 @@ static CONSUME_MIDDLE: AtomicBool = AtomicBool::new(false);
 /// Arming / Expanding 中はホイールを捨てる。Frozen では通知する。
 static IGNORE_WHEEL: AtomicBool = AtomicBool::new(false);
 static FORWARD_WHEEL: AtomicBool = AtomicBool::new(false);
+/// 射撃残留中: 左右クリックを通知するが消費しない（OS へ素通し）。
+static LINGER_WATCH: AtomicBool = AtomicBool::new(false);
 
 pub struct MouseLlHook;
 
@@ -89,6 +91,10 @@ impl MouseLlHook {
     pub fn set_forward_wheel(enabled: bool) {
         FORWARD_WHEEL.store(enabled, Ordering::Release);
     }
+
+    pub fn set_linger_watch(enabled: bool) {
+        LINGER_WATCH.store(enabled, Ordering::Release);
+    }
 }
 
 impl Drop for MouseLlHook {
@@ -103,6 +109,7 @@ impl Drop for MouseLlHook {
         CONSUME_MIDDLE.store(false, Ordering::Release);
         IGNORE_WHEEL.store(false, Ordering::Release);
         FORWARD_WHEEL.store(false, Ordering::Release);
+        LINGER_WATCH.store(false, Ordering::Release);
     }
 }
 
@@ -227,6 +234,19 @@ unsafe extern "system" fn low_level_mouse_proc(
             }
         }
         WM_LBUTTONDOWN => {
+            if LINGER_WATCH.load(Ordering::Acquire) {
+                // 残留解除用に通知するが、クリック自体は OS へ通す
+                post_hook(
+                    WaveHookKind::LeftDown,
+                    pack_point(info.pt.x, info.pt.y),
+                );
+                return CallNextHookEx(
+                    HHOOK(HOOK.load(Ordering::Acquire) as _),
+                    code,
+                    wparam,
+                    lparam,
+                );
+            }
             if FORWARD_WHEEL.load(Ordering::Acquire) || CONSUME_MIDDLE.load(Ordering::Acquire) {
                 // Frozen 中のみ本体で射撃解釈。Expanding 中も消費して誤クリック防止。
                 if FORWARD_WHEEL.load(Ordering::Acquire) {
@@ -236,6 +256,18 @@ unsafe extern "system" fn low_level_mouse_proc(
             }
         }
         WM_RBUTTONDOWN => {
+            if LINGER_WATCH.load(Ordering::Acquire) {
+                post_hook(
+                    WaveHookKind::RightDown,
+                    pack_point(info.pt.x, info.pt.y),
+                );
+                return CallNextHookEx(
+                    HHOOK(HOOK.load(Ordering::Acquire) as _),
+                    code,
+                    wparam,
+                    lparam,
+                );
+            }
             if FORWARD_WHEEL.load(Ordering::Acquire) || CONSUME_MIDDLE.load(Ordering::Acquire) {
                 if FORWARD_WHEEL.load(Ordering::Acquire) || CONSUME_MIDDLE.load(Ordering::Acquire) {
                     post_hook(WaveHookKind::RightDown, 0);
@@ -304,6 +336,7 @@ pub fn clear_consume_flags() {
     CONSUME_MIDDLE.store(false, Ordering::Release);
     IGNORE_WHEEL.store(false, Ordering::Release);
     FORWARD_WHEEL.store(false, Ordering::Release);
+    LINGER_WATCH.store(false, Ordering::Release);
 }
 
 #[allow(dead_code)]
