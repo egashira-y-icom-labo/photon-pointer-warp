@@ -210,7 +210,12 @@ impl WaveOverlay {
         (v * self.dpi_scale).round().max(1.0) as i32
     }
 
-    pub unsafe fn present_snapshot(&mut self, snap: &WaveSnapshot) -> io::Result<()> {
+    /// `sample_rgb`: 光学スキャナ結果。`None` のときは RGB 行をプレースホルダ表示。
+    pub unsafe fn present_snapshot(
+        &mut self,
+        snap: &WaveSnapshot,
+        sample_rgb: Option<(u8, u8, u8)>,
+    ) -> io::Result<()> {
         if matches!(snap.phase, WavePhaseKind::Idle | WavePhaseKind::Arming) {
             return self.hide();
         }
@@ -219,16 +224,47 @@ impl WaveOverlay {
         let total = stride * self.vs.height as usize;
         std::ptr::write_bytes(self.pixels, 0, total);
 
+        // GetPixel が背後色を拾えるよう、サンプル点中心を透明に開ける
+        let sample_screen = if snap.direction_locked
+            || matches!(
+                snap.phase,
+                WavePhaseKind::ImpactFlash | WavePhaseKind::ImpactLingering
+            ) {
+            (snap.target_x, snap.target_y)
+        } else {
+            (snap.tip_x, snap.tip_y)
+        };
+        let sample_local = (
+            sample_screen.0 as i32 - self.vs.x,
+            sample_screen.1 as i32 - self.vs.y,
+        );
+
         match snap.phase {
             WavePhaseKind::ImpactFlash => self.draw_impact_flash(snap),
-            WavePhaseKind::ImpactLingering => self.draw_impact_lingering(snap),
+            WavePhaseKind::ImpactLingering => self.draw_impact_lingering(snap, sample_rgb),
             WavePhaseKind::Converging => {
                 self.draw_converging(snap);
-                self.draw_telemetry(snap, None);
+                punch_transparent_hole(
+                    self.pixels,
+                    self.vs.width,
+                    self.vs.height,
+                    sample_local.0,
+                    sample_local.1,
+                    1,
+                );
+                self.draw_telemetry(snap, None, sample_rgb);
             }
             WavePhaseKind::Expanding | WavePhaseKind::Frozen => {
                 self.draw_wave_body(snap);
-                self.draw_telemetry(snap, None);
+                punch_transparent_hole(
+                    self.pixels,
+                    self.vs.width,
+                    self.vs.height,
+                    sample_local.0,
+                    sample_local.1,
+                    1,
+                );
+                self.draw_telemetry(snap, None, sample_rgb);
             }
             _ => self.draw_wave_body(snap),
         }
@@ -413,7 +449,12 @@ impl WaveOverlay {
         );
     }
 
-    unsafe fn draw_telemetry(&mut self, snap: &WaveSnapshot, status_override: Option<&str>) {
+    unsafe fn draw_telemetry(
+        &mut self,
+        snap: &WaveSnapshot,
+        status_override: Option<&str>,
+        sample_rgb: Option<(u8, u8, u8)>,
+    ) {
         let label = if let Some(s) = status_override {
             s
         } else {
@@ -445,18 +486,22 @@ impl WaveOverlay {
             let dy = ay - snap.origin_y;
             (dx.hypot(dy), dy.atan2(dx).to_degrees())
         };
+        let (r, g, b) = sample_rgb.unwrap_or((0, 0, 0));
+        let rgb_line = format!("RGB : {r:03}, {g:03}, {b:03} (#{r:02X}{g:02X}{b:02X})");
         let lines = [
             label.to_string(),
             format!("RNG : {rng:06.1} PX"),
             format!("AZM : {azm:+06.1} DEG"),
+            rgb_line,
         ];
 
         let anchor_x = ax as i32 - self.vs.x;
         let anchor_y = ay as i32 - self.vs.y;
         let pad = self.sx(6.0);
         let line_h = self.sx(14.0);
-        let plate_w = self.sx(148.0);
-        let plate_h = pad * 2 + line_h * 3;
+        let chip = self.sx(10.0);
+        let plate_w = self.sx(268.0);
+        let plate_h = pad * 2 + line_h * lines.len() as i32;
         let ox_off = self.sx(24.0);
         let oy_off = -self.sx(18.0);
         let mut left = anchor_x + ox_off;
@@ -561,6 +606,23 @@ impl WaveOverlay {
             left + plate_w,
             top + plate_h,
         );
+
+        // 4行目右端にカラー見本
+        if let Some((cr, cg, cb)) = sample_rgb {
+            let chip_x = left + plate_w - pad - chip;
+            let chip_y = top + pad + 3 * line_h + (line_h - chip) / 2;
+            draw_color_chip(
+                self.pixels,
+                self.vs.width,
+                self.vs.height,
+                chip_x,
+                chip_y,
+                chip,
+                cr,
+                cg,
+                cb,
+            );
+        }
     }
 
     unsafe fn draw_impact_flash(&mut self, snap: &WaveSnapshot) {
@@ -661,7 +723,11 @@ impl WaveOverlay {
         }
     }
 
-    unsafe fn draw_impact_lingering(&mut self, snap: &WaveSnapshot) {
+    unsafe fn draw_impact_lingering(
+        &mut self,
+        snap: &WaveSnapshot,
+        sample_rgb: Option<(u8, u8, u8)>,
+    ) {
         self.ensure_crack_field(snap);
         let cx = snap.target_x as i32 - self.vs.x;
         let cy = snap.target_y as i32 - self.vs.y;
@@ -694,7 +760,7 @@ impl WaveOverlay {
             self.sx(2.5),
             hash2(cx, cy),
         );
-        self.draw_telemetry(snap, Some("[OPTICS DAMAGED]"));
+        self.draw_telemetry(snap, Some("[OPTICS DAMAGED]"), sample_rgb);
     }
 
     fn ensure_crack_field(&mut self, snap: &WaveSnapshot) {
@@ -1095,35 +1161,103 @@ fn draw_reticle(
             stroke_thick_line(pixels, w, h, x, y, x + sx * arm, y, th, r, g, b, a);
             stroke_thick_line(pixels, w, h, x, y, x, y + sy * arm, th, r, g, b, a);
         }
-        stroke_thick_line(
-            pixels,
-            w,
-            h,
-            cx - cross,
-            cy,
-            cx + cross,
-            cy,
-            th,
-            r,
-            g,
-            b,
-            a,
-        );
-        stroke_thick_line(
-            pixels,
-            w,
-            h,
-            cx,
-            cy - cross,
-            cx,
-            cy + cross,
-            th,
-            r,
-            g,
-            b,
-            a,
-        );
+        // 交点中心は GetPixel 用に空けておく（外側アームのみ）
+        let gap = 2i32.max(th / 2 + 1);
+        if cross > gap {
+            stroke_thick_line(
+                pixels,
+                w,
+                h,
+                cx - cross,
+                cy,
+                cx - gap,
+                cy,
+                th,
+                r,
+                g,
+                b,
+                a,
+            );
+            stroke_thick_line(
+                pixels,
+                w,
+                h,
+                cx + gap,
+                cy,
+                cx + cross,
+                cy,
+                th,
+                r,
+                g,
+                b,
+                a,
+            );
+            stroke_thick_line(
+                pixels,
+                w,
+                h,
+                cx,
+                cy - cross,
+                cx,
+                cy - gap,
+                th,
+                r,
+                g,
+                b,
+                a,
+            );
+            stroke_thick_line(
+                pixels,
+                w,
+                h,
+                cx,
+                cy + gap,
+                cx,
+                cy + cross,
+                th,
+                r,
+                g,
+                b,
+                a,
+            );
+        }
     }
+}
+
+/// サンプル点中心を完全透明にし、GetPixel が背後色を返すようにする（既定 3×3）。
+fn punch_transparent_hole(pixels: *mut u8, w: i32, h: i32, cx: i32, cy: i32, half: i32) {
+    let half = half.max(1);
+    for y in (cy - half)..=(cy + half) {
+        for x in (cx - half)..=(cx + half) {
+            if x < 0 || y < 0 || x >= w || y >= h {
+                continue;
+            }
+            let i = ((y * w + x) * 4) as isize;
+            unsafe {
+                *pixels.offset(i) = 0;
+                *pixels.offset(i + 1) = 0;
+                *pixels.offset(i + 2) = 0;
+                *pixels.offset(i + 3) = 0;
+            }
+        }
+    }
+}
+
+fn draw_color_chip(
+    pixels: *mut u8,
+    w: i32,
+    h: i32,
+    x: i32,
+    y: i32,
+    size: i32,
+    r: u8,
+    g: u8,
+    b: u8,
+) {
+    // 白枠
+    fill_rect_alpha(pixels, w, h, x - 1, y - 1, size + 2, size + 2, 255, 255, 255, 255);
+    // 本体（不透明・premul = そのまま）
+    fill_rect_alpha(pixels, w, h, x, y, size, size, r, g, b, 255);
 }
 
 fn fill_rect_alpha(

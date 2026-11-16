@@ -69,6 +69,7 @@ use windows::Win32::System::Console::{
 
 #[cfg(debug_assertions)]
 const CP_UTF8: u32 = 65001;
+use windows::Win32::Graphics::Gdi::{GetDC, GetPixel, ReleaseDC};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
 use windows::Win32::UI::HiDpi::{
@@ -186,6 +187,8 @@ struct AppState {
     wave_finish_target: Option<(i32, i32)>,
     /// 波動中にオーバーレイがヒットを受け OS カーソルを抑止しているか。
     wave_cursor_captured: bool,
+    /// 射撃着弾時に固定した光学スキャナ RGB（残留テレメトリ用）。
+    wave_rgb_frozen: Option<(u8, u8, u8)>,
     config_mtime: Option<SystemTime>,
     raw_motion_history: VecDeque<(i32, i32, u64)>,
     input_clock_ms: u64,
@@ -425,6 +428,7 @@ pub fn run(config: AppConfig) -> io::Result<()> {
                 wave_finish_shoot: false,
                 wave_finish_target: None,
                 wave_cursor_captured: false,
+                wave_rgb_frozen: None,
                 config_mtime: config_file_mtime(),
                 raw_motion_history: VecDeque::new(),
                 input_clock_ms: 0,
@@ -1286,6 +1290,7 @@ fn handle_wave_signal(state: &mut AppState, signal: WaveSignal, now: Instant) {
     match signal {
         WaveSignal::None => {}
         WaveSignal::PassthroughDrag => {
+            state.wave_rgb_frozen = None;
             set_wave_cursor_capture(state, false, None);
             let _ = unsafe { state.wave_overlay.hide() };
             clear_consume_flags();
@@ -1293,6 +1298,7 @@ fn handle_wave_signal(state: &mut AppState, signal: WaveSignal, now: Instant) {
             eprintln!("[wave] arming → middle-drag passthrough");
         }
         WaveSignal::PassthroughClick => {
+            state.wave_rgb_frozen = None;
             set_wave_cursor_capture(state, false, None);
             let _ = unsafe { state.wave_overlay.hide() };
             clear_consume_flags();
@@ -1307,6 +1313,7 @@ fn handle_wave_signal(state: &mut AppState, signal: WaveSignal, now: Instant) {
             }
             let ox = snap.origin_x as i32;
             let oy = snap.origin_y as i32;
+            state.wave_rgb_frozen = None;
             set_wave_cursor_capture(state, true, Some((ox, oy)));
             eprintln!("[wave] expanding");
         }
@@ -1315,6 +1322,7 @@ fn handle_wave_signal(state: &mut AppState, signal: WaveSignal, now: Instant) {
         }
         WaveSignal::AscendToMap => {
             let snap = state.wave.snapshot();
+            state.wave_rgb_frozen = None;
             set_wave_cursor_capture(state, false, None);
             let _ = unsafe { state.wave_overlay.hide() };
             clear_consume_flags();
@@ -1357,6 +1365,12 @@ fn handle_wave_signal(state: &mut AppState, signal: WaveSignal, now: Instant) {
                 .unwrap_or((snap.target_x as i32, snap.target_y as i32));
             let shoot = state.wave_finish_shoot;
             eprintln!("[wave] impact at ({tx},{ty}) shoot={shoot}");
+            if shoot {
+                // 撃ち抜いた瞬間の RGB を残留用に固定
+                state.wave_rgb_frozen = sample_screen_rgb(tx, ty);
+            } else {
+                state.wave_rgb_frozen = None;
+            }
             // 射撃クリックがオーバーレイに吸われないよう、必ず先に透過を戻す
             set_wave_cursor_capture(state, false, None);
             let _ = unsafe { SetCursorPos(tx, ty) };
@@ -1371,6 +1385,7 @@ fn handle_wave_signal(state: &mut AppState, signal: WaveSignal, now: Instant) {
         WaveSignal::Finished => {
             state.wave_finish_shoot = false;
             state.wave_finish_target = None;
+            state.wave_rgb_frozen = None;
             set_wave_cursor_capture(state, false, None);
             let _ = unsafe { state.wave_overlay.hide() };
             clear_consume_flags();
@@ -1386,6 +1401,25 @@ fn ascend_wave_to_map(state: &mut AppState) -> io::Result<()> {
     request_thumbnail(state);
     open_hud_after_settle(state, TriggerSource::Circle, false)?;
     Ok(())
+}
+
+fn sample_screen_rgb(x: i32, y: i32) -> Option<(u8, u8, u8)> {
+    unsafe {
+        let hdc = GetDC(None);
+        if hdc.is_invalid() {
+            return None;
+        }
+        let col = GetPixel(hdc, x, y);
+        let _ = ReleaseDC(None, hdc);
+        // CLR_INVALID == 0xFFFFFFFF
+        if col.0 == u32::MAX {
+            return None;
+        }
+        let r = (col.0 & 0xFF) as u8;
+        let g = ((col.0 >> 8) & 0xFF) as u8;
+        let b = ((col.0 >> 16) & 0xFF) as u8;
+        Some((r, g, b))
+    }
 }
 
 fn present_wave_overlay(state: &mut AppState) -> io::Result<()> {
@@ -1408,7 +1442,24 @@ fn present_wave_overlay(state: &mut AppState) -> io::Result<()> {
         ) {
             set_wave_cursor_capture(state, false, None);
         }
-        unsafe { state.wave_overlay.present_snapshot(&snap) }
+
+        let sample_rgb = if matches!(snap.phase, WavePhaseKind::ImpactLingering) {
+            state.wave_rgb_frozen
+        } else if matches!(
+            snap.phase,
+            WavePhaseKind::Expanding | WavePhaseKind::Frozen | WavePhaseKind::Converging
+        ) {
+            let (sx, sy) = if snap.direction_locked {
+                (snap.target_x as i32, snap.target_y as i32)
+            } else {
+                (snap.tip_x as i32, snap.tip_y as i32)
+            };
+            sample_screen_rgb(sx, sy)
+        } else {
+            None
+        };
+
+        unsafe { state.wave_overlay.present_snapshot(&snap, sample_rgb) }
     }
 }
 
