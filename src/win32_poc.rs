@@ -85,8 +85,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
     GetWindowLongPtrW, KillTimer, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
     RegisterWindowMessageW, SetCursorPos, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
-    ShowCursor, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWL_EXSTYLE, MSG, PM_REMOVE,
-    SW_HIDE,
+    ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWL_EXSTYLE, MSG, PM_REMOVE, SW_HIDE,
     WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_HOTKEY, WM_INPUT, WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_MBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCMBUTTONDBLCLK, WM_SETTINGCHANGE,
     WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
@@ -185,8 +184,8 @@ struct AppState {
     /// Converging 完了時に左クリック射撃するか（WARP なら false）。
     wave_finish_shoot: bool,
     wave_finish_target: Option<(i32, i32)>,
-    /// 波動オーバーレイ表示中に OS カーソルを隠しているか。
-    wave_cursor_hidden: bool,
+    /// 波動中にオーバーレイがヒットを受け OS カーソルを抑止しているか。
+    wave_cursor_captured: bool,
     config_mtime: Option<SystemTime>,
     raw_motion_history: VecDeque<(i32, i32, u64)>,
     input_clock_ms: u64,
@@ -425,7 +424,7 @@ pub fn run(config: AppConfig) -> io::Result<()> {
                 _mouse_ll: mouse_ll,
                 wave_finish_shoot: false,
                 wave_finish_target: None,
-                wave_cursor_hidden: false,
+                wave_cursor_captured: false,
                 config_mtime: config_file_mtime(),
                 raw_motion_history: VecDeque::new(),
                 input_clock_ms: 0,
@@ -563,7 +562,7 @@ unsafe extern "system" fn wnd_proc(
             if let Some(mut guard) = APP.get().and_then(|a| a.try_lock().ok()) {
                 unregister_esc_hotkey_state(&mut guard, hwnd);
                 let _ = guard.hud.dismiss();
-                set_wave_os_cursor_hidden(&mut guard, false);
+                set_wave_cursor_capture(&mut guard, false, None);
                 let _ = unsafe { guard.wave_overlay.hide() };
                 guard.wave.reset();
                 clear_consume_flags();
@@ -1005,7 +1004,7 @@ fn handle_tray_command_sync(hwnd: HWND, id: u32) {
                 if guard.detection_paused {
                     cancel_settling(&mut guard);
                     if guard.wave.is_active() {
-                        set_wave_os_cursor_hidden(&mut guard, false);
+                        set_wave_cursor_capture(&mut guard, false, None);
                         let _ = unsafe { guard.wave_overlay.hide() };
                         guard.wave.reset();
                         clear_consume_flags();
@@ -1254,32 +1253,36 @@ fn wave_max_radius(state: &AppState) -> f32 {
     }
 }
 
-fn set_wave_os_cursor_hidden(state: &mut AppState, hide: bool) {
-    if state.wave_cursor_hidden == hide {
+/// `capture=true`: 透過解除＋OSカーソル抑止。直後に波源へ SetCursorPos してヒット／WM_SETCURSOR を再評価。
+/// `capture=false`: 透過復元（射撃クリックがオーバーレイに吸われないようにする）。
+fn set_wave_cursor_capture(state: &mut AppState, capture: bool, origin: Option<(i32, i32)>) {
+    if state.wave_cursor_captured == capture {
         return;
     }
     unsafe {
-        if hide {
-            while ShowCursor(false) >= 0 {}
-        } else {
-            while ShowCursor(true) < 0 {}
+        state.wave_overlay.set_suppress_os_cursor(capture);
+        state.wave_overlay.set_hit_test_transparent(!capture);
+        if capture {
+            if let Some((x, y)) = origin {
+                let _ = SetCursorPos(x, y);
+            }
         }
     }
-    state.wave_cursor_hidden = hide;
+    state.wave_cursor_captured = capture;
 }
 
 fn handle_wave_signal(state: &mut AppState, signal: WaveSignal, now: Instant) {
     match signal {
         WaveSignal::None => {}
         WaveSignal::PassthroughDrag => {
-            set_wave_os_cursor_hidden(state, false);
+            set_wave_cursor_capture(state, false, None);
             let _ = unsafe { state.wave_overlay.hide() };
             clear_consume_flags();
             inject_middle_down();
             eprintln!("[wave] arming → middle-drag passthrough");
         }
         WaveSignal::PassthroughClick => {
-            set_wave_os_cursor_hidden(state, false);
+            set_wave_cursor_capture(state, false, None);
             let _ = unsafe { state.wave_overlay.hide() };
             clear_consume_flags();
             inject_middle_click();
@@ -1291,8 +1294,9 @@ fn handle_wave_signal(state: &mut AppState, signal: WaveSignal, now: Instant) {
             if let Some(bounds) = wave_monitor_bounds(state, snap.origin_x, snap.origin_y) {
                 state.wave.set_aim_bounds(bounds);
             }
-            let _ = unsafe { SetCursorPos(snap.origin_x as i32, snap.origin_y as i32) };
-            set_wave_os_cursor_hidden(state, true);
+            let ox = snap.origin_x as i32;
+            let oy = snap.origin_y as i32;
+            set_wave_cursor_capture(state, true, Some((ox, oy)));
             eprintln!("[wave] expanding");
         }
         WaveSignal::Freeze => {
@@ -1300,7 +1304,7 @@ fn handle_wave_signal(state: &mut AppState, signal: WaveSignal, now: Instant) {
         }
         WaveSignal::AscendToMap => {
             let snap = state.wave.snapshot();
-            set_wave_os_cursor_hidden(state, false);
+            set_wave_cursor_capture(state, false, None);
             let _ = unsafe { state.wave_overlay.hide() };
             clear_consume_flags();
             state.wave.reset();
@@ -1342,6 +1346,8 @@ fn handle_wave_signal(state: &mut AppState, signal: WaveSignal, now: Instant) {
                 .unwrap_or((snap.target_x as i32, snap.target_y as i32));
             let shoot = state.wave_finish_shoot;
             eprintln!("[wave] impact at ({tx},{ty}) shoot={shoot}");
+            // 射撃クリックがオーバーレイに吸われないよう、必ず先に透過を戻す
+            set_wave_cursor_capture(state, false, None);
             let _ = unsafe { SetCursorPos(tx, ty) };
             if shoot {
                 inject_left_click();
@@ -1350,7 +1356,7 @@ fn handle_wave_signal(state: &mut AppState, signal: WaveSignal, now: Instant) {
         WaveSignal::Finished => {
             state.wave_finish_shoot = false;
             state.wave_finish_target = None;
-            set_wave_os_cursor_hidden(state, false);
+            set_wave_cursor_capture(state, false, None);
             let _ = unsafe { state.wave_overlay.hide() };
             clear_consume_flags();
             eprintln!("[wave] finished");
@@ -1370,6 +1376,7 @@ fn ascend_wave_to_map(state: &mut AppState) -> io::Result<()> {
 fn present_wave_overlay(state: &mut AppState) -> io::Result<()> {
     let snap = state.wave.snapshot();
     if matches!(snap.phase, WavePhaseKind::Idle | WavePhaseKind::Arming) {
+        set_wave_cursor_capture(state, false, None);
         unsafe { state.wave_overlay.hide() }
     } else {
         // Expanding / Frozen のみ波源固定。収束・着弾中はターゲットへ任せる。
@@ -1378,6 +1385,10 @@ fn present_wave_overlay(state: &mut AppState) -> io::Result<()> {
             WavePhaseKind::Expanding | WavePhaseKind::Frozen
         ) {
             let _ = unsafe { SetCursorPos(snap.origin_x as i32, snap.origin_y as i32) };
+        }
+        // ImpactFlash 中は射撃済みのため透過を維持（念のため再適用）
+        if matches!(snap.phase, WavePhaseKind::ImpactFlash) {
+            set_wave_cursor_capture(state, false, None);
         }
         unsafe { state.wave_overlay.present_snapshot(&snap) }
     }
@@ -2178,12 +2189,15 @@ unsafe extern "system" fn wave_wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    use windows::Win32::UI::WindowsAndMessaging::WM_DESTROY;
-    if msg == WM_DESTROY {
-        photon_pointer_warp::platform::wave_window::note_wave_destroyed();
-        return LRESULT(0);
+    use windows::Win32::UI::WindowsAndMessaging::{WM_DESTROY, WM_SETCURSOR};
+    match msg {
+        WM_SETCURSOR => photon_pointer_warp::platform::wave_window::handle_wave_wm_setcursor(),
+        WM_DESTROY => {
+            photon_pointer_warp::platform::wave_window::note_wave_destroyed();
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
-    DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
 unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> BOOL {

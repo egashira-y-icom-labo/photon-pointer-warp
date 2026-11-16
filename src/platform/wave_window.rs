@@ -1,11 +1,10 @@
 //! 波動照準オーバーレイ（高コントラスト二層 GDI）
 
 use std::io;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
 use crate::domain::wave::{WavePhaseKind, WaveSnapshot};
 use crate::platform::layout::VirtualScreen;
-use crate::platform::window::load_arrow_cursor;
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -14,14 +13,18 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, RegisterClassW, SetWindowDisplayAffinity, SetWindowPos, ShowWindow,
-    UpdateLayeredWindowIndirect, CS_HREDRAW, CS_VREDRAW, HWND_TOPMOST, SWP_NOACTIVATE, SW_HIDE,
-    SW_SHOWNOACTIVATE, ULW_ALPHA, UPDATELAYEREDWINDOWINFO, WDA_EXCLUDEFROMCAPTURE, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, GetWindowLongPtrW, RegisterClassW, SetCursor, SetWindowDisplayAffinity,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, UpdateLayeredWindowIndirect, CS_HREDRAW,
+    CS_VREDRAW, GWL_EXSTYLE, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, UPDATELAYEREDWINDOWINFO,
+    WDA_EXCLUDEFROMCAPTURE, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 const WAVE_CLASS: windows::core::PCWSTR = w!("PhotonPointerWarpWave");
 static WAVE_HWND: AtomicIsize = AtomicIsize::new(0);
+/// 波動中に `WM_SETCURSOR` で OS カーソルを消す。
+static SUPPRESS_OS_CURSOR: AtomicBool = AtomicBool::new(false);
 
 // 濃い黒ベース（字幕の縁取り）
 const BASE_R: u8 = 0;
@@ -29,6 +32,7 @@ const BASE_G: u8 = 0;
 const BASE_B: u8 = 0;
 const BASE_A_RING: u8 = 235;
 const BASE_A_ARROW: u8 = 245;
+const BASE_A_GUIDE: u8 = 200;
 // 白寄りの高輝度シアンコア
 const CORE_RING_R: u8 = 120;
 const CORE_RING_G: u8 = 230;
@@ -50,6 +54,8 @@ pub struct WaveOverlay {
     pixels: *mut u8,
     active: bool,
     dpi_scale: f32,
+    /// 現在 `WS_EX_TRANSPARENT` が付いているか。
+    hit_test_transparent: bool,
 }
 
 unsafe impl Send for WaveOverlay {}
@@ -63,7 +69,8 @@ impl WaveOverlay {
             lpfnWndProc: Some(wnd_proc),
             hInstance: instance,
             lpszClassName: WAVE_CLASS,
-            hCursor: load_arrow_cursor(),
+            // WM_SETCURSOR で制御するためクラスカーソルは持たない
+            hCursor: windows::Win32::UI::WindowsAndMessaging::HCURSOR::default(),
             style: CS_HREDRAW | CS_VREDRAW,
             ..Default::default()
         };
@@ -102,6 +109,7 @@ impl WaveOverlay {
 
         let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
         WAVE_HWND.store(hwnd.0 as isize, Ordering::Release);
+        SUPPRESS_OS_CURSOR.store(false, Ordering::Release);
 
         let screen_dc = GetDC(None);
         let dib_dc = CreateCompatibleDC(screen_dc);
@@ -139,11 +147,44 @@ impl WaveOverlay {
             pixels: bits as *mut u8,
             active: false,
             dpi_scale: dpi / 96.0,
+            hit_test_transparent: true,
         })
     }
 
     pub fn is_active(&self) -> bool {
         self.active
+    }
+
+    pub fn is_hit_test_transparent(&self) -> bool {
+        self.hit_test_transparent
+    }
+
+    /// マウス透過の ON/OFF。`WS_EX_NOACTIVATE` は常に維持する。
+    pub unsafe fn set_hit_test_transparent(&mut self, transparent: bool) {
+        if self.hit_test_transparent == transparent {
+            return;
+        }
+        let style = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
+        let new_style = if transparent {
+            style | (WS_EX_TRANSPARENT.0 as isize)
+        } else {
+            style & !(WS_EX_TRANSPARENT.0 as isize)
+        };
+        let _ = SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, new_style);
+        let _ = SetWindowPos(
+            self.hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+        self.hit_test_transparent = transparent;
+    }
+
+    pub fn set_suppress_os_cursor(&self, suppress: bool) {
+        SUPPRESS_OS_CURSOR.store(suppress, Ordering::Release);
     }
 
     fn sx(&self, v: f32) -> i32 {
@@ -173,6 +214,8 @@ impl WaveOverlay {
     unsafe fn draw_wave_body(&mut self, snap: &WaveSnapshot) {
         let ox = (snap.origin_x as i32 - self.vs.x).clamp(0, self.vs.width - 1);
         let oy = (snap.origin_y as i32 - self.vs.y).clamp(0, self.vs.height - 1);
+        let tip_x = snap.tip_x as i32 - self.vs.x;
+        let tip_y = snap.tip_y as i32 - self.vs.y;
         let radius = snap.radius.max(0.0) as i32;
 
         // プライマリ波: 黒ベース 7–8px + シアンコア 3px
@@ -205,42 +248,69 @@ impl WaveOverlay {
             );
         }
 
-        // 波源ドット
-        fill_disk(
+        // 波源アンカー（控えめな点＋小十字）
+        draw_origin_anchor(
             self.pixels,
             self.vs.width,
             self.vs.height,
             ox,
             oy,
-            self.sx(6.0),
-            BASE_R,
-            BASE_G,
-            BASE_B,
-            245,
+            self.sx(4.5),
+            self.sx(2.0),
         );
-        fill_disk(
+
+        // 1:1 照準ノード（黒＋シアン二重リング）
+        draw_aim_node(
             self.pixels,
             self.vs.width,
             self.vs.height,
-            ox,
-            oy,
-            self.sx(3.5),
-            CORE_ARROW_R,
-            CORE_ARROW_G,
-            CORE_ARROW_B,
-            255,
+            tip_x,
+            tip_y,
+            self.sx(6.5),
+            self.sx(2.5),
         );
 
         if snap.direction_locked && radius > 1 {
             let tx = snap.target_x as i32 - self.vs.x;
             let ty = snap.target_y as i32 - self.vs.y;
-            // 方向矢印: 黒 8–9px + 高輝度コア 4px + 矢じり
+
+            // ① 波源 → 照準ノード（控えめガイド）
             stroke_thick_line(
                 self.pixels,
                 self.vs.width,
                 self.vs.height,
                 ox,
                 oy,
+                tip_x,
+                tip_y,
+                self.sx(5.0),
+                BASE_R,
+                BASE_G,
+                BASE_B,
+                BASE_A_GUIDE,
+            );
+            stroke_thick_line(
+                self.pixels,
+                self.vs.width,
+                self.vs.height,
+                ox,
+                oy,
+                tip_x,
+                tip_y,
+                self.sx(2.0),
+                CORE_RING_R,
+                CORE_RING_G,
+                CORE_RING_B,
+                CORE_RING_A,
+            );
+
+            // ② 照準ノード → 円周交点（主役レーザー）
+            stroke_thick_line(
+                self.pixels,
+                self.vs.width,
+                self.vs.height,
+                tip_x,
+                tip_y,
                 tx,
                 ty,
                 self.sx(8.5),
@@ -253,8 +323,8 @@ impl WaveOverlay {
                 self.pixels,
                 self.vs.width,
                 self.vs.height,
-                ox,
-                oy,
+                tip_x,
+                tip_y,
                 tx,
                 ty,
                 self.sx(4.0),
@@ -267,8 +337,8 @@ impl WaveOverlay {
                 self.pixels,
                 self.vs.width,
                 self.vs.height,
-                ox,
-                oy,
+                tip_x,
+                tip_y,
                 tx,
                 ty,
                 self.sx(14.0),
@@ -303,6 +373,7 @@ impl WaveOverlay {
         mid.direction_locked = true;
         mid.target_x = snap.target_x;
         mid.target_y = snap.target_y;
+        // tip は手元ノードとして維持
         self.draw_wave_body(&mid);
         draw_reticle(
             self.pixels,
@@ -360,6 +431,8 @@ impl WaveOverlay {
     }
 
     pub unsafe fn hide(&mut self) -> io::Result<()> {
+        self.set_suppress_os_cursor(false);
+        self.set_hit_test_transparent(true);
         if self.active {
             let stride = (self.vs.width * 4) as usize;
             let total = stride * self.vs.height as usize;
@@ -424,12 +497,24 @@ impl Drop for WaveOverlay {
             let _ = DeleteDC(self.dib_dc);
             let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
             WAVE_HWND.store(0, Ordering::Release);
+            SUPPRESS_OS_CURSOR.store(false, Ordering::Release);
         }
     }
 }
 
 pub fn note_wave_destroyed() {
     WAVE_HWND.store(0, Ordering::Release);
+    SUPPRESS_OS_CURSOR.store(false, Ordering::Release);
+}
+
+/// `WM_SETCURSOR` 用: 波動中はカーソルを消し、それ以外は矢印。
+pub unsafe fn handle_wave_wm_setcursor() -> LRESULT {
+    if SUPPRESS_OS_CURSOR.load(Ordering::Acquire) {
+        let _ = SetCursor(windows::Win32::UI::WindowsAndMessaging::HCURSOR::default());
+        LRESULT(1)
+    } else {
+        crate::platform::window::handle_wm_setcursor()
+    }
 }
 
 unsafe fn put_px(pixels: *mut u8, w: i32, h: i32, x: i32, y: i32, b: u8, g: u8, r: u8, a: u8) {
@@ -542,6 +627,81 @@ fn stroke_thick_line(
     }
 }
 
+fn draw_origin_anchor(
+    pixels: *mut u8,
+    w: i32,
+    h: i32,
+    cx: i32,
+    cy: i32,
+    radius: i32,
+    cross: i32,
+) {
+    fill_disk(
+        pixels, w, h, cx, cy, radius + 1, BASE_R, BASE_G, BASE_B, 230,
+    );
+    fill_disk(
+        pixels, w, h, cx, cy, radius, CORE_RING_R, CORE_RING_G, CORE_RING_B, 220,
+    );
+    stroke_thick_line(
+        pixels,
+        w,
+        h,
+        cx - cross,
+        cy,
+        cx + cross,
+        cy,
+        2,
+        BASE_R,
+        BASE_G,
+        BASE_B,
+        220,
+    );
+    stroke_thick_line(
+        pixels,
+        w,
+        h,
+        cx,
+        cy - cross,
+        cx,
+        cy + cross,
+        2,
+        BASE_R,
+        BASE_G,
+        BASE_B,
+        220,
+    );
+}
+
+fn draw_aim_node(
+    pixels: *mut u8,
+    w: i32,
+    h: i32,
+    cx: i32,
+    cy: i32,
+    radius: i32,
+    thickness: i32,
+) {
+    stroke_ring(
+        pixels, w, h, cx, cy, radius, thickness + 3, BASE_R, BASE_G, BASE_B, 245,
+    );
+    stroke_ring(
+        pixels,
+        w,
+        h,
+        cx,
+        cy,
+        radius,
+        thickness,
+        CORE_ARROW_R,
+        CORE_ARROW_G,
+        CORE_ARROW_B,
+        255,
+    );
+    fill_disk(
+        pixels, w, h, cx, cy, 2, CORE_ARROW_R, CORE_ARROW_G, CORE_ARROW_B, 255,
+    );
+}
+
 fn draw_arrowhead(
     pixels: *mut u8,
     w: i32,
@@ -571,7 +731,6 @@ fn draw_arrowhead(
     let r_y = (base_y - py * wing).round() as i32;
     let tip_xi = tip_x.round() as i32;
     let tip_yi = tip_y.round() as i32;
-    // 黒ベース
     stroke_thick_line(
         pixels, w, h, tip_xi, tip_yi, l_x, l_y, core + 3, BASE_R, BASE_G, BASE_B, BASE_A_ARROW,
     );
@@ -581,7 +740,6 @@ fn draw_arrowhead(
     stroke_thick_line(
         pixels, w, h, l_x, l_y, r_x, r_y, core + 2, BASE_R, BASE_G, BASE_B, BASE_A_ARROW,
     );
-    // 高輝度コア
     stroke_thick_line(
         pixels,
         w,

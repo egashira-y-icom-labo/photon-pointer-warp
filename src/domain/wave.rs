@@ -13,9 +13,9 @@ pub const FROZEN_WHEEL_DEBOUNCE_MS: u64 = 50;
 /// 候補切替 1 ステップに必要なホイール累積。
 pub const WHEEL_DELTA_STEP: i32 = 120;
 /// 方角未確定の遊び（波源からの距離）。
-pub const POINTER_DEADZONE_PX: f32 = 8.0;
-/// 相対移動の感度（通常ポインティングに近い）。
-pub const POINTER_SCALE: f32 = 0.9;
+pub const POINTER_DEADZONE_PX: f32 = 16.0;
+/// 相対移動の感度（1:1 ポインティング）。
+pub const POINTER_SCALE: f32 = 1.0;
 /// Expanding 中の自動拡大速度。
 pub const RADIUS_GROWTH_PX_PER_MS: f32 = 0.55;
 /// 進む／戻すボタンでの半径変化速度。
@@ -973,7 +973,7 @@ mod tests {
         w.on_relative_move(50.0, 0.0, 210);
         let s = w.snapshot();
         assert!(s.direction_locked);
-        assert!((s.tip_x - (100.0 + 50.0 * 0.9)).abs() < 0.5);
+        assert!((s.tip_x - (100.0 + 50.0 * 1.0)).abs() < 0.5);
         assert!((s.angle_rad).abs() < 0.05 || (TAU - s.angle_rad).abs() < 0.05);
         assert!(s.radius > 1.0);
         let (tx, ty) = (s.target_x, s.target_y);
@@ -999,9 +999,9 @@ mod tests {
 
     #[test]
     fn deadzone_keeps_direction_unlocked() {
-        let (locked, _) = pointer_heading(0.0, 0.0, 3.0, 0.0, 8.0);
+        let (locked, _) = pointer_heading(0.0, 0.0, 10.0, 0.0, 16.0);
         assert!(!locked);
-        let (locked, _) = pointer_heading(0.0, 0.0, 10.0, 0.0, 8.0);
+        let (locked, _) = pointer_heading(0.0, 0.0, 20.0, 0.0, 16.0);
         assert!(locked);
     }
 
