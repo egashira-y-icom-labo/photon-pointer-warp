@@ -9,3 +9,4 @@ pub mod settle;
 pub mod shake;
 pub mod tracking;
 pub mod trigger;
+pub mod wave;

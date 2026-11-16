@@ -24,11 +24,18 @@ use photon_pointer_warp::domain::settle::{decide_settle, policy_for, SettleDecis
 use photon_pointer_warp::domain::shake::ShakeDetector;
 use photon_pointer_warp::domain::tracking::{TrackingAction, TrackingController};
 use photon_pointer_warp::domain::trigger::{TriggerCoordinator, TriggerSource};
+use photon_pointer_warp::domain::wave::{
+    max_radius_to_monitor_edge, WaveController, WavePhaseKind, WaveSignal,
+};
 use photon_pointer_warp::platform::calibrate_window::CALIBRATE_MUTEX_NAME;
 use photon_pointer_warp::platform::capture::{capture_thumbnails, ThumbnailLayer};
 use photon_pointer_warp::platform::i18n;
 use photon_pointer_warp::platform::layout::{warp_target_for_cell, MINIMAP_GRID};
 use photon_pointer_warp::platform::misc::get_system_ui_language;
+use photon_pointer_warp::platform::mouse_ll::{
+    self, clear_consume_flags, inject_left_click, inject_middle_click, inject_middle_down,
+    MouseLlHook, WaveHookKind, WM_WAVE_HOOK,
+};
 use photon_pointer_warp::platform::monitors::{capture_display_snapshot, DisplaySnapshot};
 use photon_pointer_warp::platform::operator::{self, OPERATOR_EXE_ENV};
 use photon_pointer_warp::platform::startup;
@@ -37,6 +44,7 @@ use photon_pointer_warp::platform::tray::{
     IDM_DISMISS_SUGGESTION, IDM_EXIT, IDM_LANG_AUTO, IDM_LANG_EN, IDM_LANG_JA, IDM_PAUSE,
     IDM_STARTUP, IDM_TOGGLE_THUMBNAIL, WM_TRAYICON,
 };
+use photon_pointer_warp::platform::wave_window::WaveOverlay;
 use photon_pointer_warp::platform::window::HudOverlay;
 use windows::core::w;
 #[cfg(debug_assertions)]
@@ -98,6 +106,8 @@ static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 const DEBUG_TIMER_ID: usize = 1;
 const TRACK_TIMER_ID: usize = 3;
 const DISPLAY_TIMER_ID: usize = 4;
+const WAVE_TIMER_ID: usize = 5;
+const WAVE_TIMER_MS: u32 = 16;
 const ESC_HOTKEY_ID: i32 = 2;
 const WM_OPEN_ADJUST: u32 = WM_APP + 2;
 const WM_THUMBNAIL_READY: u32 = WM_APP + 3;
@@ -167,6 +177,12 @@ struct AppState {
     tray: Option<TrayIcon>,
     calibrate_child: Option<Child>,
     operator_child: Option<Child>,
+    wave: WaveController,
+    wave_overlay: WaveOverlay,
+    _mouse_ll: MouseLlHook,
+    /// Converging 完了時に左クリック射撃するか（WARP なら false）。
+    wave_finish_shoot: bool,
+    wave_finish_target: Option<(i32, i32)>,
     config_mtime: Option<SystemTime>,
     raw_motion_history: VecDeque<(i32, i32, u64)>,
     input_clock_ms: u64,
@@ -367,6 +383,10 @@ pub fn run(config: AppConfig) -> io::Result<()> {
         let language = Language::resolve(config.language, get_system_ui_language());
         let tray = TrayIcon::add(hwnd, instance, language)
             .map_err(|e| io::Error::other(format!("tray: {e}")))?;
+        let wave_overlay = WaveOverlay::create(instance, wave_wnd_proc)
+            .map_err(|e| io::Error::other(format!("WaveOverlay::create: {e}")))?;
+        let mouse_ll = MouseLlHook::install(hwnd)
+            .map_err(|e| io::Error::other(format!("MouseLlHook::install: {e}")))?;
         let (thumbnail_tx, thumbnail_rx) = mpsc::channel();
 
         APP.get_or_init(|| {
@@ -396,6 +416,11 @@ pub fn run(config: AppConfig) -> io::Result<()> {
                 tray: Some(tray),
                 calibrate_child: None,
                 operator_child: None,
+                wave: WaveController::new(Default::default()),
+                wave_overlay,
+                _mouse_ll: mouse_ll,
+                wave_finish_shoot: false,
+                wave_finish_target: None,
                 config_mtime: config_file_mtime(),
                 raw_motion_history: VecDeque::new(),
                 input_clock_ms: 0,
@@ -415,6 +440,7 @@ pub fn run(config: AppConfig) -> io::Result<()> {
         register_raw_input(hwnd)?;
 
         let _ = SetTimer(hwnd, DEBUG_TIMER_ID, DEBUG_TIMER_MS, None);
+        let _ = SetTimer(hwnd, WAVE_TIMER_ID, WAVE_TIMER_MS, None);
 
         let _ = ShowWindow(hwnd, SW_HIDE);
 
@@ -480,7 +506,13 @@ unsafe extern "system" fn wnd_proc(
                         eprintln!("[display] refresh failed: {e}");
                     }
                 }
+            } else if wparam.0 == WAVE_TIMER_ID {
+                tick_wave_session();
             }
+            LRESULT(0)
+        }
+        WM_WAVE_HOOK => {
+            handle_wave_hook(wparam, lparam);
             LRESULT(0)
         }
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
@@ -522,9 +554,13 @@ unsafe extern "system" fn wnd_proc(
         WM_DESTROY => {
             let _ = KillTimer(hwnd, DEBUG_TIMER_ID);
             let _ = KillTimer(hwnd, DISPLAY_TIMER_ID);
+            let _ = KillTimer(hwnd, WAVE_TIMER_ID);
             if let Some(mut guard) = APP.get().and_then(|a| a.try_lock().ok()) {
                 unregister_esc_hotkey_state(&mut guard, hwnd);
                 let _ = guard.hud.dismiss();
+                let _ = unsafe { guard.wave_overlay.hide() };
+                guard.wave.reset();
+                clear_consume_flags();
                 guard.tray = None;
             }
             PostQuitMessage(0);
@@ -962,11 +998,17 @@ fn handle_tray_command_sync(hwnd: HWND, id: u32) {
                 guard.detection_paused = !guard.detection_paused;
                 if guard.detection_paused {
                     cancel_settling(&mut guard);
+                    if guard.wave.is_active() {
+                        let _ = unsafe { guard.wave_overlay.hide() };
+                        guard.wave.reset();
+                        clear_consume_flags();
+                    }
                 }
                 let paused = guard.detection_paused;
                 if let Some(tray) = guard.tray.as_mut() {
                     unsafe { tray.set_paused(paused) };
                 }
+                sync_wave_hook_flags(&guard);
             }
         }
         IDM_STARTUP => {
@@ -1055,6 +1097,7 @@ fn flush_pending_on_idle() {
         Some(g) => g,
         None => return,
     };
+    sync_wave_hook_flags(&guard);
     let idle = guard
         .last_input_at
         .map(|t| t.elapsed().as_millis() as u64)
@@ -1079,6 +1122,225 @@ fn flush_pending_on_idle() {
         dismiss_hud_with_log(HudCloseReason::OutOfBounds);
     } else if should_auto_timeout {
         dismiss_hud_with_log(HudCloseReason::AutoTimeout);
+    }
+}
+
+fn sync_wave_hook_flags(state: &AppState) {
+    let map_busy = !matches!(state.hud_phase, HudPhase::Idle) || state.hud.is_active();
+    let passthrough = state.detection_paused || state.calibrating || map_busy;
+    MouseLlHook::set_passthrough(passthrough);
+    let kind = state.wave.phase_kind();
+    let wave_on = state.wave.is_active();
+    MouseLlHook::set_consume_middle(wave_on);
+    MouseLlHook::set_ignore_wheel(matches!(
+        kind,
+        WavePhaseKind::Arming
+            | WavePhaseKind::Expanding
+            | WavePhaseKind::Converging
+            | WavePhaseKind::ImpactFlash
+            | WavePhaseKind::CancelRewind
+    ));
+    MouseLlHook::set_forward_wheel(matches!(kind, WavePhaseKind::Frozen));
+}
+
+fn handle_wave_hook(wparam: WPARAM, lparam: LPARAM) {
+    let Some(kind) = WaveHookKind::from_usize(wparam.0) else {
+        return;
+    };
+    let mut guard = match APP.get().and_then(|a| a.try_lock().ok()) {
+        Some(g) => g,
+        None => return,
+    };
+    let now = Instant::now();
+    let clock = mono_ms(guard.clock_origin, now);
+    sync_wave_hook_flags(&guard);
+    let signal = match kind {
+        WaveHookKind::MiddleDown => {
+            if guard.detection_paused || guard.calibrating || guard.hud.is_active() {
+                clear_consume_flags();
+                inject_middle_down();
+                return;
+            }
+            let (x, y) = mouse_ll::unpack_point(lparam.0);
+            guard.wave.on_middle_down(x as f32, y as f32, clock)
+        }
+        WaveHookKind::MiddleUp => guard.wave.on_middle_up(clock),
+        WaveHookKind::Wheel => guard.wave.on_wheel(lparam.0 as i32, clock),
+        WaveHookKind::XButtonForwardDown => {
+            guard.wave.on_grow_button(true);
+            WaveSignal::None
+        }
+        WaveHookKind::XButtonForwardUp => {
+            guard.wave.on_grow_button(false);
+            WaveSignal::None
+        }
+        WaveHookKind::XButtonBackDown => {
+            guard.wave.on_shrink_button(true);
+            WaveSignal::None
+        }
+        WaveHookKind::XButtonBackUp => {
+            guard.wave.on_shrink_button(false);
+            WaveSignal::None
+        }
+        WaveHookKind::LeftDown => guard.wave.on_left_click(clock),
+        WaveHookKind::RightDown => guard.wave.on_right_click(clock),
+    };
+    handle_wave_signal(&mut guard, signal, now);
+    sync_wave_hook_flags(&guard);
+    let _ = present_wave_overlay(&mut guard);
+}
+
+fn tick_wave_session() {
+    let mut guard = match APP.get().and_then(|a| a.try_lock().ok()) {
+        Some(g) => g,
+        None => return,
+    };
+    if !guard.wave.is_active() {
+        sync_wave_hook_flags(&guard);
+        return;
+    }
+    let now = Instant::now();
+    let clock = mono_ms(guard.clock_origin, now);
+    let max_r = wave_max_radius(&guard);
+    let signal = guard.wave.on_tick(clock, max_r);
+    handle_wave_signal(&mut guard, signal, now);
+    sync_wave_hook_flags(&guard);
+    let _ = present_wave_overlay(&mut guard);
+}
+
+fn wave_max_radius(state: &AppState) -> f32 {
+    let snap = state.wave.snapshot();
+    let (x, y) = (snap.origin_x, snap.origin_y);
+    let mon = state
+        .display
+        .monitors
+        .iter()
+        .find(|m| {
+            let r = m.rect;
+            x >= r.left as f32
+                && x < r.right as f32
+                && y >= r.top as f32
+                && y < r.bottom as f32
+        })
+        .or_else(|| state.display.monitors.first());
+    if let Some(mon) = mon {
+        max_radius_to_monitor_edge(
+            x,
+            y,
+            mon.rect.left as f32,
+            mon.rect.top as f32,
+            mon.rect.right as f32,
+            mon.rect.bottom as f32,
+        )
+    } else {
+        400.0
+    }
+}
+
+fn handle_wave_signal(state: &mut AppState, signal: WaveSignal, now: Instant) {
+    match signal {
+        WaveSignal::None => {}
+        WaveSignal::PassthroughDrag => {
+            let _ = unsafe { state.wave_overlay.hide() };
+            clear_consume_flags();
+            inject_middle_down();
+            eprintln!("[wave] arming → middle-drag passthrough");
+        }
+        WaveSignal::PassthroughClick => {
+            let _ = unsafe { state.wave_overlay.hide() };
+            clear_consume_flags();
+            inject_middle_click();
+            eprintln!("[wave] arming → middle-click passthrough");
+        }
+        WaveSignal::StartExpanding => {
+            state.coordinator.reset();
+            let snap = state.wave.snapshot();
+            let _ = unsafe { SetCursorPos(snap.origin_x as i32, snap.origin_y as i32) };
+            eprintln!("[wave] expanding");
+        }
+        WaveSignal::Freeze => {
+            eprintln!("[wave] frozen r={:.0}", state.wave.snapshot().radius);
+        }
+        WaveSignal::AscendToMap => {
+            let snap = state.wave.snapshot();
+            let _ = unsafe { state.wave_overlay.hide() };
+            clear_consume_flags();
+            state.wave.reset();
+            eprintln!("[wave] ascend → map HUD");
+            state.buttons_down = 0;
+            state.coordinator.reset();
+            let _ = unsafe { SetCursorPos(snap.origin_x as i32, snap.origin_y as i32) };
+            if let Err(e) = ascend_wave_to_map(state) {
+                eprintln!("[wave] ascend map failed: {e}");
+            }
+        }
+        WaveSignal::ConvergeShoot => {
+            state.wave_finish_shoot = true;
+            let snap = state.wave.snapshot();
+            state.wave_finish_target = Some((snap.target_x as i32, snap.target_y as i32));
+            eprintln!(
+                "[wave] converge shoot → ({:.0},{:.0})",
+                snap.target_x, snap.target_y
+            );
+        }
+        WaveSignal::ConvergeWarp => {
+            state.wave_finish_shoot = false;
+            let snap = state.wave.snapshot();
+            state.wave_finish_target = Some((snap.target_x as i32, snap.target_y as i32));
+            eprintln!(
+                "[wave] converge warp → ({:.0},{:.0})",
+                snap.target_x, snap.target_y
+            );
+        }
+        WaveSignal::CancelRewind => {
+            state.wave_finish_shoot = false;
+            state.wave_finish_target = None;
+            eprintln!("[wave] cancel rewind");
+        }
+        WaveSignal::Impact => {
+            let snap = state.wave.snapshot();
+            let (tx, ty) = state
+                .wave_finish_target
+                .unwrap_or((snap.target_x as i32, snap.target_y as i32));
+            let shoot = state.wave_finish_shoot;
+            eprintln!("[wave] impact at ({tx},{ty}) shoot={shoot}");
+            let _ = unsafe { SetCursorPos(tx, ty) };
+            if shoot {
+                inject_left_click();
+            }
+        }
+        WaveSignal::Finished => {
+            state.wave_finish_shoot = false;
+            state.wave_finish_target = None;
+            let _ = unsafe { state.wave_overlay.hide() };
+            clear_consume_flags();
+            eprintln!("[wave] finished");
+        }
+    }
+    let _ = now;
+}
+
+fn ascend_wave_to_map(state: &mut AppState) -> io::Result<()> {
+    let _ = refresh_display_if_stale(state)?;
+    bind_hud_map(state);
+    request_thumbnail(state);
+    open_hud_after_settle(state, TriggerSource::Circle, false)?;
+    Ok(())
+}
+
+fn present_wave_overlay(state: &mut AppState) -> io::Result<()> {
+    let snap = state.wave.snapshot();
+    if matches!(snap.phase, WavePhaseKind::Idle | WavePhaseKind::Arming) {
+        unsafe { state.wave_overlay.hide() }
+    } else {
+        // Expanding / Frozen のみ波源固定。収束・着弾中はターゲットへ任せる。
+        if matches!(
+            snap.phase,
+            WavePhaseKind::Expanding | WavePhaseKind::Frozen
+        ) {
+            let _ = unsafe { SetCursorPos(snap.origin_x as i32, snap.origin_y as i32) };
+        }
+        unsafe { state.wave_overlay.present_snapshot(&snap) }
     }
 }
 
@@ -1388,6 +1650,17 @@ unsafe fn handle_wm_input(lparam: LPARAM) -> io::Result<()> {
 
     if dx != 0.0 || dy != 0.0 {
         push_motion_history(&mut guard, dx, dy, dt_millis);
+    }
+
+    if guard.wave.is_active() {
+        let clock = mono_ms(guard.clock_origin, now);
+        let signal = guard.wave.on_relative_move(dx, dy, clock);
+        handle_wave_signal(&mut guard, signal, now);
+        if guard.wave.is_active() {
+            // 波動中はマップジェスチャを抑止
+            guard.coordinator.reset();
+            return Ok(());
+        }
     }
 
     if matches!(guard.hud_phase, HudPhase::Settling(_)) {
@@ -1858,6 +2131,20 @@ unsafe extern "system" fn hud_wnd_proc(
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+unsafe extern "system" fn wave_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::WM_DESTROY;
+    if msg == WM_DESTROY {
+        photon_pointer_warp::platform::wave_window::note_wave_destroyed();
+        return LRESULT(0);
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
 unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> BOOL {
