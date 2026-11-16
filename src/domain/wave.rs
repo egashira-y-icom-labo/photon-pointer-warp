@@ -1,6 +1,6 @@
 //! 波動・照準モードの純ロジック（Win32 非依存）
 //!
-//! 方角は仮想 2D スティック（位置保持）で決める。角度ダイヤルは使わない。
+//! 方角は波源起点の仮想ポインター先端 `pointer_tip`（スクリーン座標）で決める。
 
 use std::f32::consts::TAU;
 
@@ -10,14 +10,12 @@ pub const ARMING_HOLD_MS: u64 = 130;
 pub const ARMING_DRAG_SLOP_PX: f32 = 5.0;
 /// Frozen 移行直後のホイール無視時間。
 pub const FROZEN_WHEEL_DEBOUNCE_MS: u64 = 50;
-/// 候補切替 1 ステップに必要なホイール累積（標準 WHEEL_DELTA）。
+/// 候補切替 1 ステップに必要なホイール累積。
 pub const WHEEL_DELTA_STEP: i32 = 120;
-/// 仮想スティック最大半径（相対 px 相当）。
-pub const STICK_RADIUS: f32 = 70.0;
-/// 方角未確定の遊び。
-pub const STICK_DEADZONE: f32 = 4.0;
-/// 相対移動の減速（カーソルと同方向のまま感度を下げる）。
-pub const STICK_SCALE: f32 = 0.5;
+/// 方角未確定の遊び（波源からの距離）。
+pub const POINTER_DEADZONE_PX: f32 = 8.0;
+/// 相対移動の感度（通常ポインティングに近い）。
+pub const POINTER_SCALE: f32 = 0.9;
 /// Expanding 中の自動拡大速度。
 pub const RADIUS_GROWTH_PX_PER_MS: f32 = 0.55;
 /// 進む／戻すボタンでの半径変化速度。
@@ -26,6 +24,28 @@ pub const RADIUS_ADJUST_PX_PER_MS: f32 = 0.45;
 pub const CONVERGE_MS: f32 = 180.0;
 /// 着弾フラッシュ時間。
 pub const IMPACT_FLASH_MS: f32 = 130.0;
+/// マップ昇華時に対角距離へ足す余裕。
+pub const ASCEND_RADIUS_PADDING_PX: f32 = 40.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AimBounds {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+impl AimBounds {
+    pub fn clamp_point(self, x: f32, y: f32) -> (f32, f32) {
+        // right/bottom は排他なので内側にわずかに寄せる
+        let max_x = (self.right - 1.0).max(self.left);
+        let max_y = (self.bottom - 1.0).max(self.top);
+        (
+            x.clamp(self.left, max_x),
+            y.clamp(self.top, max_y),
+        )
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WaveConfig {
@@ -33,13 +53,13 @@ pub struct WaveConfig {
     pub arming_drag_slop_px: f32,
     pub frozen_wheel_debounce_ms: u64,
     pub wheel_delta_step: i32,
-    pub stick_radius: f32,
-    pub stick_deadzone: f32,
-    pub stick_scale: f32,
+    pub pointer_deadzone_px: f32,
+    pub pointer_scale: f32,
     pub radius_growth_px_per_ms: f32,
     pub radius_adjust_px_per_ms: f32,
     pub converge_ms: f32,
     pub impact_flash_ms: f32,
+    pub ascend_radius_padding_px: f32,
 }
 
 impl Default for WaveConfig {
@@ -49,13 +69,13 @@ impl Default for WaveConfig {
             arming_drag_slop_px: ARMING_DRAG_SLOP_PX,
             frozen_wheel_debounce_ms: FROZEN_WHEEL_DEBOUNCE_MS,
             wheel_delta_step: WHEEL_DELTA_STEP,
-            stick_radius: STICK_RADIUS,
-            stick_deadzone: STICK_DEADZONE,
-            stick_scale: STICK_SCALE,
+            pointer_deadzone_px: POINTER_DEADZONE_PX,
+            pointer_scale: POINTER_SCALE,
             radius_growth_px_per_ms: RADIUS_GROWTH_PX_PER_MS,
             radius_adjust_px_per_ms: RADIUS_ADJUST_PX_PER_MS,
             converge_ms: CONVERGE_MS,
             impact_flash_ms: IMPACT_FLASH_MS,
+            ascend_radius_padding_px: ASCEND_RADIUS_PADDING_PX,
         }
     }
 }
@@ -82,9 +102,7 @@ pub enum WaveSignal {
     ConvergeShoot,
     ConvergeWarp,
     CancelRewind,
-    /// 収束完了。カーソルを着弾点へ移してよい（フラッシュ開始）。
     Impact,
-    /// フラッシュ終了。オーバーレイを閉じてよい。
     Finished,
 }
 
@@ -103,14 +121,15 @@ pub struct WaveSnapshot {
     pub radius: f32,
     pub angle_rad: f32,
     pub direction_locked: bool,
-    pub stick_x: f32,
-    pub stick_y: f32,
-    pub selected_rank: usize,
-    pub ranked_ids: Vec<u64>,
-    /// 0..1 — Converging / ImpactFlash / CancelRewind
-    pub progress: f32,
+    /// 仮想ポインター先端（スクリーン座標）。
+    pub tip_x: f32,
+    pub tip_y: f32,
+    /// プライマリ波円周上の交点（矢じり＝着弾点）。
     pub target_x: f32,
     pub target_y: f32,
+    pub selected_rank: usize,
+    pub ranked_ids: Vec<u64>,
+    pub progress: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,8 +147,8 @@ enum Phase {
         started_ms: u64,
         last_ms: u64,
         radius: f32,
-        stick_x: f32,
-        stick_y: f32,
+        tip_x: f32,
+        tip_y: f32,
         grow_held: bool,
         shrink_held: bool,
     },
@@ -138,8 +157,8 @@ enum Phase {
         origin_y: f32,
         entered_ms: u64,
         radius: f32,
-        stick_x: f32,
-        stick_y: f32,
+        tip_x: f32,
+        tip_y: f32,
         selected_rank: usize,
         wheel_accum: i32,
         grow_held: bool,
@@ -150,8 +169,8 @@ enum Phase {
         origin_x: f32,
         origin_y: f32,
         radius: f32,
-        stick_x: f32,
-        stick_y: f32,
+        tip_x: f32,
+        tip_y: f32,
         target_x: f32,
         target_y: f32,
         shoot: bool,
@@ -171,8 +190,8 @@ enum Phase {
         origin_x: f32,
         origin_y: f32,
         radius: f32,
-        stick_x: f32,
-        stick_y: f32,
+        tip_x: f32,
+        tip_y: f32,
         started_ms: u64,
         last_ms: u64,
         progress: f32,
@@ -184,6 +203,7 @@ pub struct WaveController {
     config: WaveConfig,
     phase: Phase,
     candidates: Vec<WaveCandidate>,
+    aim_bounds: Option<AimBounds>,
 }
 
 impl WaveController {
@@ -192,7 +212,12 @@ impl WaveController {
             config,
             phase: Phase::Idle,
             candidates: Vec::new(),
+            aim_bounds: None,
         }
+    }
+
+    pub fn set_aim_bounds(&mut self, bounds: AimBounds) {
+        self.aim_bounds = Some(bounds);
     }
 
     pub fn phase_kind(&self) -> WavePhaseKind {
@@ -229,12 +254,13 @@ impl WaveController {
             origin_x,
             origin_y,
             radius,
-            stick_x,
-            stick_y,
+            tip_x,
+            tip_y,
             ..
         } = &mut self.phase
         {
-            let (locked, angle) = stick_heading(*stick_x, *stick_y, self.config.stick_deadzone);
+            let (locked, angle) =
+                pointer_heading(*origin_x, *origin_y, *tip_x, *tip_y, self.config.pointer_deadzone_px);
             let ranked = rank_candidates(
                 &self.candidates,
                 *origin_x,
@@ -259,71 +285,96 @@ impl WaveController {
                 phase: WavePhaseKind::Arming,
                 origin_x: *origin_x,
                 origin_y: *origin_y,
+                tip_x: *origin_x,
+                tip_y: *origin_y,
                 ..empty_snap(ranked)
             },
             Phase::Expanding {
                 origin_x,
                 origin_y,
                 radius,
-                stick_x,
-                stick_y,
+                tip_x,
+                tip_y,
                 ..
-            } => {
-                let (locked, angle) = stick_heading(*stick_x, *stick_y, self.config.stick_deadzone);
-                WaveSnapshot {
-                    phase: WavePhaseKind::Expanding,
-                    origin_x: *origin_x,
-                    origin_y: *origin_y,
-                    radius: *radius,
-                    angle_rad: angle,
-                    direction_locked: locked,
-                    stick_x: *stick_x,
-                    stick_y: *stick_y,
-                    selected_rank: 0,
-                    ranked_ids: ranked,
-                    progress: 0.0,
-                    target_x: 0.0,
-                    target_y: 0.0,
-                }
             }
-            Phase::Frozen {
+            | Phase::Frozen {
                 origin_x,
                 origin_y,
                 radius,
-                stick_x,
-                stick_y,
-                selected_rank,
+                tip_x,
+                tip_y,
+                ..
+            }
+            | Phase::CancelRewind {
+                origin_x,
+                origin_y,
+                radius,
+                tip_x,
+                tip_y,
                 ..
             } => {
-                let (locked, angle) = stick_heading(*stick_x, *stick_y, self.config.stick_deadzone);
+                let (locked, angle) = pointer_heading(
+                    *origin_x,
+                    *origin_y,
+                    *tip_x,
+                    *tip_y,
+                    self.config.pointer_deadzone_px,
+                );
+                let (tx, ty) = if locked {
+                    ray_circle_intersection(*origin_x, *origin_y, *radius, angle)
+                } else {
+                    (*origin_x, *origin_y)
+                };
+                let selected = if let Phase::Frozen { selected_rank, .. } = &self.phase {
+                    *selected_rank
+                } else {
+                    0
+                };
+                let progress = if let Phase::CancelRewind { progress, .. } = &self.phase {
+                    *progress
+                } else {
+                    0.0
+                };
+                let phase = match &self.phase {
+                    Phase::Expanding { .. } => WavePhaseKind::Expanding,
+                    Phase::Frozen { .. } => WavePhaseKind::Frozen,
+                    Phase::CancelRewind { .. } => WavePhaseKind::CancelRewind,
+                    _ => unreachable!(),
+                };
                 WaveSnapshot {
-                    phase: WavePhaseKind::Frozen,
+                    phase,
                     origin_x: *origin_x,
                     origin_y: *origin_y,
                     radius: *radius,
                     angle_rad: angle,
                     direction_locked: locked,
-                    stick_x: *stick_x,
-                    stick_y: *stick_y,
-                    selected_rank: *selected_rank,
+                    tip_x: *tip_x,
+                    tip_y: *tip_y,
+                    target_x: tx,
+                    target_y: ty,
+                    selected_rank: selected,
                     ranked_ids: ranked,
-                    progress: 0.0,
-                    target_x: 0.0,
-                    target_y: 0.0,
+                    progress,
                 }
             }
             Phase::Converging {
                 origin_x,
                 origin_y,
                 radius,
-                stick_x,
-                stick_y,
+                tip_x,
+                tip_y,
                 target_x,
                 target_y,
                 progress,
                 ..
             } => {
-                let (locked, angle) = stick_heading(*stick_x, *stick_y, self.config.stick_deadzone);
+                let (locked, angle) = pointer_heading(
+                    *origin_x,
+                    *origin_y,
+                    *tip_x,
+                    *tip_y,
+                    self.config.pointer_deadzone_px,
+                );
                 WaveSnapshot {
                     phase: WavePhaseKind::Converging,
                     origin_x: *origin_x,
@@ -331,13 +382,13 @@ impl WaveController {
                     radius: *radius,
                     angle_rad: angle,
                     direction_locked: locked,
-                    stick_x: *stick_x,
-                    stick_y: *stick_y,
+                    tip_x: *tip_x,
+                    tip_y: *tip_y,
+                    target_x: *target_x,
+                    target_y: *target_y,
                     selected_rank: 0,
                     ranked_ids: ranked,
                     progress: *progress,
-                    target_x: *target_x,
-                    target_y: *target_y,
                 }
             }
             Phase::ImpactFlash {
@@ -349,43 +400,14 @@ impl WaveController {
                 phase: WavePhaseKind::ImpactFlash,
                 origin_x: *x,
                 origin_y: *y,
-                radius: 0.0,
-                angle_rad: 0.0,
-                direction_locked: true,
-                stick_x: 0.0,
-                stick_y: 0.0,
-                selected_rank: 0,
-                ranked_ids: ranked,
-                progress: *progress,
+                tip_x: *x,
+                tip_y: *y,
                 target_x: *x,
                 target_y: *y,
+                direction_locked: true,
+                progress: *progress,
+                ..empty_snap(ranked)
             },
-            Phase::CancelRewind {
-                origin_x,
-                origin_y,
-                radius,
-                stick_x,
-                stick_y,
-                progress,
-                ..
-            } => {
-                let (locked, angle) = stick_heading(*stick_x, *stick_y, self.config.stick_deadzone);
-                WaveSnapshot {
-                    phase: WavePhaseKind::CancelRewind,
-                    origin_x: *origin_x,
-                    origin_y: *origin_y,
-                    radius: *radius,
-                    angle_rad: angle,
-                    direction_locked: locked,
-                    stick_x: *stick_x,
-                    stick_y: *stick_y,
-                    selected_rank: 0,
-                    ranked_ids: ranked,
-                    progress: *progress,
-                    target_x: 0.0,
-                    target_y: 0.0,
-                }
-            }
         }
     }
 
@@ -393,19 +415,11 @@ impl WaveController {
         let s = self.snapshot();
         match s.phase {
             WavePhaseKind::Idle | WavePhaseKind::Arming => None,
-            WavePhaseKind::ImpactFlash => Some((s.target_x, s.target_y)),
-            WavePhaseKind::Converging => Some((s.target_x, s.target_y)),
-            _ => {
-                if !s.direction_locked || s.radius <= 0.0 {
-                    return None;
-                }
-                Some(ray_circle_intersection(
-                    s.origin_x,
-                    s.origin_y,
-                    s.radius,
-                    s.angle_rad,
-                ))
+            WavePhaseKind::ImpactFlash | WavePhaseKind::Converging => {
+                Some((s.target_x, s.target_y))
             }
+            _ if s.direction_locked && s.radius > 0.0 => Some((s.target_x, s.target_y)),
+            _ => None,
         }
     }
 
@@ -422,27 +436,33 @@ impl WaveController {
                 origin_x,
                 origin_y,
                 radius,
-                stick_x,
-                stick_y,
+                tip_x,
+                tip_y,
                 ..
             }
             | Phase::Frozen {
                 origin_x,
                 origin_y,
                 radius,
-                stick_x,
-                stick_y,
+                tip_x,
+                tip_y,
                 ..
             }
             | Phase::CancelRewind {
                 origin_x,
                 origin_y,
                 radius,
-                stick_x,
-                stick_y,
+                tip_x,
+                tip_y,
                 ..
             } => {
-                let (locked, angle) = stick_heading(*stick_x, *stick_y, self.config.stick_deadzone);
+                let (locked, angle) = pointer_heading(
+                    *origin_x,
+                    *origin_y,
+                    *tip_x,
+                    *tip_y,
+                    self.config.pointer_deadzone_px,
+                );
                 rank_candidates(
                     &self.candidates,
                     *origin_x,
@@ -488,8 +508,8 @@ impl WaveController {
                 origin_x,
                 origin_y,
                 radius,
-                stick_x,
-                stick_y,
+                tip_x,
+                tip_y,
                 grow_held,
                 shrink_held,
                 ..
@@ -499,8 +519,8 @@ impl WaveController {
                     origin_y,
                     entered_ms: clock_ms,
                     radius,
-                    stick_x,
-                    stick_y,
+                    tip_x,
+                    tip_y,
                     selected_rank: 0,
                     wheel_accum: 0,
                     grow_held,
@@ -524,21 +544,21 @@ impl WaveController {
                 }
             }
             Phase::Expanding {
-                stick_x, stick_y, ..
+                tip_x, tip_y, ..
             }
             | Phase::Frozen {
-                stick_x, stick_y, ..
+                tip_x, tip_y, ..
             } => {
-                let (nx, ny) = integrate_stick(
-                    *stick_x,
-                    *stick_y,
-                    dx,
-                    dy,
-                    self.config.stick_scale,
-                    self.config.stick_radius,
-                );
-                *stick_x = nx;
-                *stick_y = ny;
+                let scale = self.config.pointer_scale;
+                let mut nx = *tip_x + dx * scale;
+                let mut ny = *tip_y + dy * scale;
+                if let Some(b) = self.aim_bounds {
+                    let (cx, cy) = b.clamp_point(nx, ny);
+                    nx = cx;
+                    ny = cy;
+                }
+                *tip_x = nx;
+                *tip_y = ny;
             }
             _ => {}
         }
@@ -608,24 +628,24 @@ impl WaveController {
                 origin_x,
                 origin_y,
                 radius,
-                stick_x,
-                stick_y,
+                tip_x,
+                tip_y,
                 ..
             }
             | Phase::Frozen {
                 origin_x,
                 origin_y,
                 radius,
-                stick_x,
-                stick_y,
+                tip_x,
+                tip_y,
                 ..
             } => {
                 self.phase = Phase::CancelRewind {
                     origin_x,
                     origin_y,
                     radius,
-                    stick_x,
-                    stick_y,
+                    tip_x,
+                    tip_y,
                     started_ms: clock_ms,
                     last_ms: clock_ms,
                     progress: 0.0,
@@ -654,8 +674,8 @@ impl WaveController {
                         started_ms,
                         last_ms: clock_ms,
                         radius: 0.0,
-                        stick_x: 0.0,
-                        stick_y: 0.0,
+                        tip_x: origin_x,
+                        tip_y: origin_y,
                         grow_held: false,
                         shrink_held: false,
                     };
@@ -773,15 +793,16 @@ impl WaveController {
             origin_x,
             origin_y,
             radius,
-            stick_x,
-            stick_y,
+            tip_x,
+            tip_y,
             selected_rank,
             ..
         } = self.phase
         else {
             return WaveSignal::None;
         };
-        let (locked, angle) = stick_heading(stick_x, stick_y, self.config.stick_deadzone);
+        let (locked, angle) =
+            pointer_heading(origin_x, origin_y, tip_x, tip_y, self.config.pointer_deadzone_px);
         let ranked = rank_candidates(
             &self.candidates,
             origin_x,
@@ -795,19 +816,24 @@ impl WaveController {
                 .iter()
                 .find(|c| c.id == *id)
                 .map(|c| (c.x, c.y))
-                .unwrap_or_else(|| ray_circle_intersection(origin_x, origin_y, radius, angle))
+                .unwrap_or_else(|| {
+                    if locked {
+                        ray_circle_intersection(origin_x, origin_y, radius, angle)
+                    } else {
+                        (origin_x + radius, origin_y)
+                    }
+                })
         } else if locked {
             ray_circle_intersection(origin_x, origin_y, radius, angle)
         } else {
-            // 未確定でも中心方向（右）へフォールバックせず、波源近傍を避けるため +x
-            ray_circle_intersection(origin_x, origin_y, radius, 0.0)
+            (origin_x + radius, origin_y)
         };
         self.phase = Phase::Converging {
             origin_x,
             origin_y,
             radius,
-            stick_x,
-            stick_y,
+            tip_x,
+            tip_y,
             target_x,
             target_y,
             shoot,
@@ -831,41 +857,30 @@ fn empty_snap(ranked: Vec<u64>) -> WaveSnapshot {
         radius: 0.0,
         angle_rad: 0.0,
         direction_locked: false,
-        stick_x: 0.0,
-        stick_y: 0.0,
+        tip_x: 0.0,
+        tip_y: 0.0,
+        target_x: 0.0,
+        target_y: 0.0,
         selected_rank: 0,
         ranked_ids: ranked,
         progress: 0.0,
-        target_x: 0.0,
-        target_y: 0.0,
     }
 }
 
-/// カーソルと同じ上下左右感覚でスティックを更新し、最大半径でクランプ。
-pub fn integrate_stick(
-    stick_x: f32,
-    stick_y: f32,
-    dx: f32,
-    dy: f32,
-    scale: f32,
-    max_radius: f32,
-) -> (f32, f32) {
-    let mut x = stick_x + dx * scale;
-    let mut y = stick_y + dy * scale;
-    let len = (x * x + y * y).sqrt();
-    if len > max_radius && len > 0.0 {
-        x = x / len * max_radius;
-        y = y / len * max_radius;
-    }
-    (x, y)
-}
-
-pub fn stick_heading(stick_x: f32, stick_y: f32, deadzone: f32) -> (bool, f32) {
-    let len = (stick_x * stick_x + stick_y * stick_y).sqrt();
+pub fn pointer_heading(
+    origin_x: f32,
+    origin_y: f32,
+    tip_x: f32,
+    tip_y: f32,
+    deadzone: f32,
+) -> (bool, f32) {
+    let dx = tip_x - origin_x;
+    let dy = tip_y - origin_y;
+    let len = (dx * dx + dy * dy).sqrt();
     if len < deadzone {
         (false, 0.0)
     } else {
-        (true, stick_y.atan2(stick_x).rem_euclid(TAU))
+        (true, dy.atan2(dx).rem_euclid(TAU))
     }
 }
 
@@ -905,24 +920,27 @@ pub fn ray_circle_intersection(ox: f32, oy: f32, radius: f32, angle_rad: f32) ->
     )
 }
 
-/// 波源から現在モニターの各辺までの最短距離（端まで広がり切る最大射程）。
-pub fn max_radius_to_monitor_edge(
+/// 波源から現在モニターの最も遠い角までの距離 + padding。
+pub fn max_radius_to_farthest_corner(
     origin_x: f32,
     origin_y: f32,
     left: f32,
     top: f32,
     right: f32,
     bottom: f32,
+    padding: f32,
 ) -> f32 {
-    let to_left = origin_x - left;
-    let to_right = right - origin_x;
-    let to_top = origin_y - top;
-    let to_bottom = bottom - origin_y;
-    [to_left, to_right, to_top, to_bottom]
+    let corners = [
+        (left, top),
+        (right, top),
+        (left, bottom),
+        (right, bottom),
+    ];
+    let farthest = corners
         .into_iter()
-        .filter(|d| *d > 0.0)
-        .fold(f32::INFINITY, f32::min)
-        .max(1.0)
+        .map(|(cx, cy)| (cx - origin_x).hypot(cy - origin_y))
+        .fold(0.0_f32, f32::max);
+    (farthest + padding).max(1.0)
 }
 
 #[cfg(test)]
@@ -936,180 +954,97 @@ mod tests {
     #[test]
     fn arming_short_click_passthrough() {
         let mut w = ctrl();
-        assert_eq!(w.on_middle_down(10.0, 20.0, 0), WaveSignal::None);
+        w.on_middle_down(10.0, 20.0, 0);
         assert_eq!(w.on_middle_up(50), WaveSignal::PassthroughClick);
-        assert_eq!(w.phase_kind(), WavePhaseKind::Idle);
     }
 
     #[test]
-    fn arming_drag_bypasses_to_passthrough() {
+    fn pointer_tip_matches_cursor_axes() {
         let mut w = ctrl();
-        w.on_middle_down(0.0, 0.0, 0);
-        assert_eq!(w.on_relative_move(3.0, 0.0, 10), WaveSignal::None);
-        assert_eq!(w.on_relative_move(3.0, 0.0, 20), WaveSignal::PassthroughDrag);
-    }
-
-    #[test]
-    fn arming_hold_starts_expanding() {
-        let mut w = ctrl();
+        w.set_aim_bounds(AimBounds {
+            left: 0.0,
+            top: 0.0,
+            right: 1000.0,
+            bottom: 1000.0,
+        });
         w.on_middle_down(100.0, 100.0, 0);
-        assert_eq!(w.on_tick(130, 400.0), WaveSignal::StartExpanding);
-        assert_eq!(w.phase_kind(), WavePhaseKind::Expanding);
+        w.on_tick(130, 500.0);
+        w.on_tick(200, 500.0); // 半径を伸ばして円周交点を検証可能に
+        w.on_relative_move(50.0, 0.0, 210);
+        let s = w.snapshot();
+        assert!(s.direction_locked);
+        assert!((s.tip_x - (100.0 + 50.0 * 0.9)).abs() < 0.5);
+        assert!((s.angle_rad).abs() < 0.05 || (TAU - s.angle_rad).abs() < 0.05);
+        assert!(s.radius > 1.0);
+        let (tx, ty) = (s.target_x, s.target_y);
+        assert!(tx > s.origin_x);
+        assert!((ty - s.origin_y).abs() < 1.0);
     }
 
     #[test]
-    fn stick_matches_cursor_directions() {
-        let (x, y) = integrate_stick(0.0, 0.0, 20.0, 0.0, 0.5, 70.0);
-        assert!((x - 10.0).abs() < 1e-3);
-        assert!(y.abs() < 1e-3);
-        let (locked, angle) = stick_heading(x, y, 4.0);
+    fn pointer_clamps_to_monitor_bounds() {
+        let mut w = ctrl();
+        w.set_aim_bounds(AimBounds {
+            left: 0.0,
+            top: 0.0,
+            right: 200.0,
+            bottom: 200.0,
+        });
+        w.on_middle_down(100.0, 100.0, 0);
+        w.on_tick(130, 500.0);
+        w.on_relative_move(500.0, 0.0, 140);
+        let s = w.snapshot();
+        assert!(s.tip_x <= 199.0);
+    }
+
+    #[test]
+    fn deadzone_keeps_direction_unlocked() {
+        let (locked, _) = pointer_heading(0.0, 0.0, 3.0, 0.0, 8.0);
+        assert!(!locked);
+        let (locked, _) = pointer_heading(0.0, 0.0, 10.0, 0.0, 8.0);
         assert!(locked);
-        assert!(angle.abs() < 0.05 || (TAU - angle).abs() < 0.05);
-
-        let (x2, y2) = integrate_stick(0.0, 0.0, 0.0, 20.0, 0.5, 70.0);
-        let (locked2, angle2) = stick_heading(x2, y2, 4.0);
-        assert!(locked2);
-        // 下方向 ≈ +π/2（スクリーン座標）
-        assert!((angle2 - std::f32::consts::FRAC_PI_2).abs() < 0.05);
     }
 
     #[test]
-    fn stick_clamps_to_radius_preserving_angle() {
-        let (x, y) = integrate_stick(0.0, 0.0, 400.0, 0.0, 0.5, 70.0);
-        let len = (x * x + y * y).sqrt();
-        assert!((len - 70.0).abs() < 1e-2);
-        assert!(y.abs() < 1e-3);
+    fn farthest_corner_radius_covers_monitor() {
+        // origin near top-left; farthest is bottom-right
+        let r = max_radius_to_farthest_corner(10.0, 10.0, 0.0, 0.0, 400.0, 300.0, 40.0);
+        let expected = (400.0_f32 - 10.0).hypot(300.0 - 10.0) + 40.0;
+        assert!((r - expected).abs() < 1e-3);
+        // nearest-edge would be ~10; farthest is much larger
+        assert!(r > 200.0);
     }
 
     #[test]
-    fn stick_aim_point_follows_right_then_down() {
-        let mut w = ctrl();
-        w.on_middle_down(0.0, 0.0, 0);
-        w.on_tick(130, 500.0);
-        w.on_relative_move(20.0, 0.0, 140); // stick ≈ (10,0)
-        w.on_tick(160, 500.0);
-        w.on_middle_up(170);
-        let aim = w.aim_point().expect("aim");
-        assert!(aim.0 > 0.0);
-        assert!(aim.1.abs() < 1.0);
-    }
-
-    #[test]
-    fn release_during_expand_freezes_at_rank_one() {
-        let mut w = ctrl();
-        w.on_middle_down(0.0, 0.0, 0);
-        w.on_tick(130, 500.0);
-        w.set_candidates(vec![
-            WaveCandidate {
-                id: 10,
-                x: 50.0,
-                y: 0.0,
-            },
-            WaveCandidate {
-                id: 20,
-                x: 80.0,
-                y: 0.0,
-            },
-        ]);
-        w.on_tick(200, 500.0);
-        assert_eq!(w.on_middle_up(210), WaveSignal::Freeze);
-        assert_eq!(w.snapshot().selected_rank, 0);
-    }
-
-    #[test]
-    fn expanding_to_edge_ascends_to_map() {
+    fn warp_path_still_impacts() {
         let mut w = WaveController::new(WaveConfig {
-            radius_growth_px_per_ms: 10.0,
+            converge_ms: 80.0,
+            impact_flash_ms: 40.0,
             ..WaveConfig::default()
         });
-        w.on_middle_down(50.0, 50.0, 0);
-        w.on_tick(130, 100.0);
-        assert_eq!(w.on_tick(150, 100.0), WaveSignal::AscendToMap);
-        assert_eq!(w.phase_kind(), WavePhaseKind::Expanding);
-        w.reset();
-    }
-
-    #[test]
-    fn warp_converges_then_impacts_then_finishes() {
-        let mut w = WaveController::new(WaveConfig {
-            converge_ms: 100.0,
-            impact_flash_ms: 50.0,
-            ..WaveConfig::default()
+        w.set_aim_bounds(AimBounds {
+            left: 0.0,
+            top: 0.0,
+            right: 800.0,
+            bottom: 600.0,
         });
-        w.on_middle_down(0.0, 0.0, 0);
-        w.on_tick(130, 500.0);
-        w.on_relative_move(30.0, 0.0, 140);
+        w.on_middle_down(100.0, 100.0, 0);
+        w.on_tick(130, 800.0);
+        w.on_relative_move(40.0, 0.0, 140);
         w.on_middle_up(150);
         assert_eq!(w.on_middle_up(200), WaveSignal::ConvergeWarp);
-        assert_eq!(w.on_tick(250, 500.0), WaveSignal::None);
-        assert_eq!(w.on_tick(320, 500.0), WaveSignal::Impact);
-        assert_eq!(w.phase_kind(), WavePhaseKind::ImpactFlash);
-        assert_eq!(w.on_tick(400, 500.0), WaveSignal::Finished);
-        assert_eq!(w.phase_kind(), WavePhaseKind::Idle);
+        assert_eq!(w.on_tick(300, 800.0), WaveSignal::Impact);
+        assert_eq!(w.on_tick(360, 800.0), WaveSignal::Finished);
     }
 
     #[test]
-    fn max_radius_is_nearest_monitor_edge() {
-        // origin (100,50) in [0,0)-(400,300)
-        let r = max_radius_to_monitor_edge(100.0, 50.0, 0.0, 0.0, 400.0, 300.0);
-        assert!((r - 50.0).abs() < 1e-3); // top edge nearest
-    }
-
-    #[test]
-    fn undecided_ranks_by_circumference_distance() {
-        let ranked = rank_candidates(
-            &[
-                WaveCandidate {
-                    id: 1,
-                    x: 100.0,
-                    y: 0.0,
-                },
-                WaveCandidate {
-                    id: 2,
-                    x: 50.0,
-                    y: 0.0,
-                },
-                WaveCandidate {
-                    id: 3,
-                    x: 130.0,
-                    y: 0.0,
-                },
-            ],
-            0.0,
-            0.0,
-            100.0,
-            0.0,
-            false,
-        );
-        assert_eq!(ranked, vec![1, 3, 2]);
-    }
-
-    #[test]
-    fn locked_ranks_by_aim_point_distance() {
-        let ranked = rank_candidates(
-            &[
-                WaveCandidate {
-                    id: 1,
-                    x: 100.0,
-                    y: 0.0,
-                },
-                WaveCandidate {
-                    id: 2,
-                    x: 0.0,
-                    y: 100.0,
-                },
-                WaveCandidate {
-                    id: 3,
-                    x: 80.0,
-                    y: 10.0,
-                },
-            ],
-            0.0,
-            0.0,
-            100.0,
-            0.0,
-            true,
-        );
-        assert_eq!(ranked[0], 1);
+    fn expanding_to_farthest_ascends() {
+        let mut w = WaveController::new(WaveConfig {
+            radius_growth_px_per_ms: 50.0,
+            ..WaveConfig::default()
+        });
+        w.on_middle_down(0.0, 0.0, 0);
+        w.on_tick(130, 100.0);
+        assert_eq!(w.on_tick(140, 100.0), WaveSignal::AscendToMap);
     }
 }

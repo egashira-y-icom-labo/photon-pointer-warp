@@ -1,13 +1,13 @@
-//! 波動照準オーバーレイ（GDI レイヤード / 二層描画）
+//! 波動照準オーバーレイ（高コントラスト二層 GDI）
 
 use std::io;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
-use crate::domain::wave::{ray_circle_intersection, WavePhaseKind, WaveSnapshot};
+use crate::domain::wave::{WavePhaseKind, WaveSnapshot};
 use crate::platform::layout::VirtualScreen;
 use crate::platform::window::load_arrow_cursor;
 use windows::core::w;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject, BITMAPINFO,
     BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC,
@@ -23,16 +23,24 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const WAVE_CLASS: windows::core::PCWSTR = w!("PhotonPointerWarpWave");
 static WAVE_HWND: AtomicIsize = AtomicIsize::new(0);
 
-// コア色（高輝度シアン／エメラルド）
-const CORE_R: u8 = 80;
-const CORE_G: u8 = 245;
-const CORE_B: u8 = 230;
-const CORE_A: u8 = 245;
-// アウトライン（暗色）
-const OUT_R: u8 = 10;
-const OUT_G: u8 = 20;
-const OUT_B: u8 = 28;
-const OUT_A: u8 = 230;
+// 濃い黒ベース（字幕の縁取り）
+const BASE_R: u8 = 0;
+const BASE_G: u8 = 0;
+const BASE_B: u8 = 0;
+const BASE_A_RING: u8 = 235;
+const BASE_A_ARROW: u8 = 245;
+// 白寄りの高輝度シアンコア
+const CORE_RING_R: u8 = 120;
+const CORE_RING_G: u8 = 230;
+const CORE_RING_B: u8 = 235;
+const CORE_RING_A: u8 = 230;
+const CORE_ARROW_R: u8 = 210;
+const CORE_ARROW_G: u8 = 255;
+const CORE_ARROW_B: u8 = 255;
+const CORE_ARROW_A: u8 = 255;
+const WHITE_R: u8 = 255;
+const WHITE_G: u8 = 255;
+const WHITE_B: u8 = 255;
 
 pub struct WaveOverlay {
     hwnd: HWND,
@@ -151,22 +159,10 @@ impl WaveOverlay {
         let total = stride * self.vs.height as usize;
         std::ptr::write_bytes(self.pixels, 0, total);
 
-        let ox = (snap.origin_x as i32 - self.vs.x).clamp(0, self.vs.width - 1);
-        let oy = (snap.origin_y as i32 - self.vs.y).clamp(0, self.vs.height - 1);
-
         match snap.phase {
-            WavePhaseKind::ImpactFlash => {
-                self.draw_impact_flash(snap);
-            }
-            WavePhaseKind::Converging => {
-                self.draw_converging(snap, ox, oy);
-            }
-            WavePhaseKind::CancelRewind => {
-                self.draw_wave_body(snap, ox, oy, snap.radius as i32);
-            }
-            _ => {
-                self.draw_wave_body(snap, ox, oy, snap.radius.max(0.0) as i32);
-            }
+            WavePhaseKind::ImpactFlash => self.draw_impact_flash(snap),
+            WavePhaseKind::Converging => self.draw_converging(snap),
+            _ => self.draw_wave_body(snap),
         }
 
         self.show_bits()?;
@@ -174,11 +170,12 @@ impl WaveOverlay {
         Ok(())
     }
 
-    unsafe fn draw_wave_body(&mut self, snap: &WaveSnapshot, ox: i32, oy: i32, radius: i32) {
-        let ring_core = self.sx(4.5);
-        let ray_core = self.sx(3.0);
-        let outline = self.sx(2.5);
+    unsafe fn draw_wave_body(&mut self, snap: &WaveSnapshot) {
+        let ox = (snap.origin_x as i32 - self.vs.x).clamp(0, self.vs.width - 1);
+        let oy = (snap.origin_y as i32 - self.vs.y).clamp(0, self.vs.height - 1);
+        let radius = snap.radius.max(0.0) as i32;
 
+        // プライマリ波: 黒ベース 7–8px + シアンコア 3px
         if radius > 0 {
             stroke_ring(
                 self.pixels,
@@ -187,11 +184,11 @@ impl WaveOverlay {
                 ox,
                 oy,
                 radius,
-                ring_core + outline,
-                OUT_R,
-                OUT_G,
-                OUT_B,
-                OUT_A,
+                self.sx(7.5),
+                BASE_R,
+                BASE_G,
+                BASE_B,
+                BASE_A_RING,
             );
             stroke_ring(
                 self.pixels,
@@ -200,41 +197,26 @@ impl WaveOverlay {
                 ox,
                 oy,
                 radius,
-                ring_core,
-                CORE_R,
-                CORE_G,
-                CORE_B,
-                CORE_A,
+                self.sx(3.0),
+                CORE_RING_R,
+                CORE_RING_G,
+                CORE_RING_B,
+                CORE_RING_A,
             );
         }
 
-        // 波源リング
-        let origin_r = self.sx(7.0);
-        stroke_ring(
+        // 波源ドット
+        fill_disk(
             self.pixels,
             self.vs.width,
             self.vs.height,
             ox,
             oy,
-            origin_r,
-            self.sx(3.0) + outline / 2,
-            OUT_R,
-            OUT_G,
-            OUT_B,
-            OUT_A,
-        );
-        stroke_ring(
-            self.pixels,
-            self.vs.width,
-            self.vs.height,
-            ox,
-            oy,
-            origin_r,
-            self.sx(3.0),
-            CORE_R,
-            CORE_G,
-            CORE_B,
-            CORE_A,
+            self.sx(6.0),
+            BASE_R,
+            BASE_G,
+            BASE_B,
+            245,
         );
         fill_disk(
             self.pixels,
@@ -242,66 +224,30 @@ impl WaveOverlay {
             self.vs.height,
             ox,
             oy,
-            self.sx(3.0),
+            self.sx(3.5),
+            CORE_ARROW_R,
+            CORE_ARROW_G,
+            CORE_ARROW_B,
             255,
-            255,
-            255,
-            230,
         );
 
-        // 仮想スティックガイド
-        if snap.stick_x.abs() > 0.5 || snap.stick_y.abs() > 0.5 {
-            let guide_scale = self.dpi_scale;
-            let gx = ox + (snap.stick_x * guide_scale).round() as i32;
-            let gy = oy + (snap.stick_y * guide_scale).round() as i32;
-            fill_disk(
-                self.pixels,
-                self.vs.width,
-                self.vs.height,
-                gx,
-                gy,
-                self.sx(4.0) + 1,
-                OUT_R,
-                OUT_G,
-                OUT_B,
-                OUT_A,
-            );
-            fill_disk(
-                self.pixels,
-                self.vs.width,
-                self.vs.height,
-                gx,
-                gy,
-                self.sx(4.0),
-                255,
-                220,
-                80,
-                240,
-            );
-        }
-
         if snap.direction_locked && radius > 1 {
-            let (ax, ay) = ray_circle_intersection(
-                snap.origin_x,
-                snap.origin_y,
-                snap.radius,
-                snap.angle_rad,
-            );
-            let ax = ax as i32 - self.vs.x;
-            let ay = ay as i32 - self.vs.y;
+            let tx = snap.target_x as i32 - self.vs.x;
+            let ty = snap.target_y as i32 - self.vs.y;
+            // 方向矢印: 黒 8–9px + 高輝度コア 4px + 矢じり
             stroke_thick_line(
                 self.pixels,
                 self.vs.width,
                 self.vs.height,
                 ox,
                 oy,
-                ax,
-                ay,
-                ray_core + outline,
-                OUT_R,
-                OUT_G,
-                OUT_B,
-                OUT_A,
+                tx,
+                ty,
+                self.sx(8.5),
+                BASE_R,
+                BASE_G,
+                BASE_B,
+                BASE_A_ARROW,
             );
             stroke_thick_line(
                 self.pixels,
@@ -309,56 +255,63 @@ impl WaveOverlay {
                 self.vs.height,
                 ox,
                 oy,
-                ax,
-                ay,
-                ray_core,
-                CORE_R,
-                CORE_G,
-                CORE_B,
-                CORE_A,
+                tx,
+                ty,
+                self.sx(4.0),
+                CORE_ARROW_R,
+                CORE_ARROW_G,
+                CORE_ARROW_B,
+                CORE_ARROW_A,
             );
-            draw_corner_brackets(
+            draw_arrowhead(
                 self.pixels,
                 self.vs.width,
                 self.vs.height,
-                ax,
-                ay,
-                self.sx(16.0),
-                self.sx(2.0),
-                outline,
+                ox,
+                oy,
+                tx,
+                ty,
+                self.sx(14.0),
+                self.sx(3.0),
             );
-        } else if radius > 1 {
-            // 未確定でも薄いガイド放射線（右向き初期）は出さず、円だけ
+            draw_reticle(
+                self.pixels,
+                self.vs.width,
+                self.vs.height,
+                tx,
+                ty,
+                self.sx(18.0),
+                self.sx(2.5),
+            );
         }
     }
 
-    unsafe fn draw_converging(&mut self, snap: &WaveSnapshot, ox: i32, oy: i32) {
+    unsafe fn draw_converging(&mut self, snap: &WaveSnapshot) {
         let t = snap.progress.clamp(0.0, 1.0);
         let ease = t * t * (3.0 - 2.0 * t);
+        let ox = snap.origin_x as i32 - self.vs.x;
+        let oy = snap.origin_y as i32 - self.vs.y;
         let tx = snap.target_x as i32 - self.vs.x;
         let ty = snap.target_y as i32 - self.vs.y;
         let cx = ox as f32 + (tx - ox) as f32 * ease;
         let cy = oy as f32 + (ty - oy) as f32 * ease;
-        let radius = (snap.radius * (1.0 - ease * 0.85)).max(8.0) as i32;
-        let mut mid = WaveSnapshot {
-            origin_x: cx + self.vs.x as f32,
-            origin_y: cy + self.vs.y as f32,
-            radius: radius as f32,
-            direction_locked: true,
-            ..snap.clone()
-        };
-        // 収束中は照準をターゲットへ寄せる
-        mid.angle_rad = (ty as f32 - cy).atan2(tx as f32 - cx);
-        self.draw_wave_body(&mid, cx as i32, cy as i32, radius);
-        draw_corner_brackets(
+        let radius = (snap.radius * (1.0 - ease * 0.85)).max(10.0);
+        let mut mid = snap.clone();
+        mid.origin_x = cx + self.vs.x as f32;
+        mid.origin_y = cy + self.vs.y as f32;
+        mid.radius = radius;
+        mid.direction_locked = true;
+        mid.target_x = snap.target_x;
+        mid.target_y = snap.target_y;
+        self.draw_wave_body(&mid);
+        draw_reticle(
             self.pixels,
             self.vs.width,
             self.vs.height,
             tx,
             ty,
-            self.sx(16.0),
-            self.sx(2.5),
-            self.sx(2.0),
+            self.sx(18.0),
+            self.sx(3.0),
         );
     }
 
@@ -366,11 +319,9 @@ impl WaveOverlay {
         let cx = snap.target_x as i32 - self.vs.x;
         let cy = snap.target_y as i32 - self.vs.y;
         let t = snap.progress.clamp(0.0, 1.0);
-        let pulse = 1.0 - (t - 0.5).abs() * 2.0;
-        let pulse = pulse.clamp(0.0, 1.0);
-        let r1 = self.sx(10.0 + 28.0 * t);
-        let r2 = self.sx(18.0 + 40.0 * t);
-        let a = (220.0 * (1.0 - t) * (0.4 + 0.6 * pulse)) as u8;
+        let a = ((1.0 - t) * 240.0) as u8;
+        let r1 = self.sx(12.0 + 32.0 * t);
+        let r2 = self.sx(22.0 + 48.0 * t);
         stroke_ring(
             self.pixels,
             self.vs.width,
@@ -378,11 +329,11 @@ impl WaveOverlay {
             cx,
             cy,
             r2,
-            self.sx(3.0),
-            OUT_R,
-            OUT_G,
-            OUT_B,
-            a.max(40),
+            self.sx(6.0),
+            BASE_R,
+            BASE_G,
+            BASE_B,
+            a.max(50),
         );
         stroke_ring(
             self.pixels,
@@ -391,21 +342,20 @@ impl WaveOverlay {
             cx,
             cy,
             r1,
-            self.sx(4.0),
-            CORE_R,
-            CORE_G,
-            CORE_B,
-            a.max(60),
+            self.sx(3.5),
+            CORE_ARROW_R,
+            CORE_ARROW_G,
+            CORE_ARROW_B,
+            a.max(70),
         );
-        draw_corner_brackets(
+        draw_reticle(
             self.pixels,
             self.vs.width,
             self.vs.height,
             cx,
             cy,
-            self.sx(18.0),
+            self.sx(20.0),
             self.sx(3.0),
-            self.sx(2.0),
         );
     }
 
@@ -493,13 +443,13 @@ unsafe fn put_px(pixels: *mut u8, w: i32, h: i32, x: i32, y: i32, b: u8, g: u8, 
     let dst_a = *pixels.offset(i + 3) as u16;
     let src_a = a as u16;
     let out_a = src_a + dst_a * (255 - src_a) / 255;
-    let premul = |s: u8, d: u16| -> u8 {
+    let blend = |s: u8, d: u16| -> u8 {
         let s = (s as u16 * src_a) / 255;
         ((s + d * (255 - src_a) / 255).min(255)) as u8
     };
-    *pixels.offset(i) = premul(b, dst_b);
-    *pixels.offset(i + 1) = premul(g, dst_g);
-    *pixels.offset(i + 2) = premul(r, dst_r);
+    *pixels.offset(i) = blend(b, dst_b);
+    *pixels.offset(i + 1) = blend(g, dst_g);
+    *pixels.offset(i + 2) = blend(r, dst_r);
     *pixels.offset(i + 3) = out_a.min(255) as u8;
 }
 
@@ -592,7 +542,78 @@ fn stroke_thick_line(
     }
 }
 
-fn draw_corner_brackets(
+fn draw_arrowhead(
+    pixels: *mut u8,
+    w: i32,
+    h: i32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    size: i32,
+    core: i32,
+) {
+    let dx = (x1 - x0) as f32;
+    let dy = (y1 - y0) as f32;
+    let len = (dx * dx + dy * dy).sqrt().max(1.0);
+    let ux = dx / len;
+    let uy = dy / len;
+    let px = -uy;
+    let py = ux;
+    let tip_x = x1 as f32;
+    let tip_y = y1 as f32;
+    let base_x = tip_x - ux * size as f32;
+    let base_y = tip_y - uy * size as f32;
+    let wing = size as f32 * 0.55;
+    let l_x = (base_x + px * wing).round() as i32;
+    let l_y = (base_y + py * wing).round() as i32;
+    let r_x = (base_x - px * wing).round() as i32;
+    let r_y = (base_y - py * wing).round() as i32;
+    let tip_xi = tip_x.round() as i32;
+    let tip_yi = tip_y.round() as i32;
+    // 黒ベース
+    stroke_thick_line(
+        pixels, w, h, tip_xi, tip_yi, l_x, l_y, core + 3, BASE_R, BASE_G, BASE_B, BASE_A_ARROW,
+    );
+    stroke_thick_line(
+        pixels, w, h, tip_xi, tip_yi, r_x, r_y, core + 3, BASE_R, BASE_G, BASE_B, BASE_A_ARROW,
+    );
+    stroke_thick_line(
+        pixels, w, h, l_x, l_y, r_x, r_y, core + 2, BASE_R, BASE_G, BASE_B, BASE_A_ARROW,
+    );
+    // 高輝度コア
+    stroke_thick_line(
+        pixels,
+        w,
+        h,
+        tip_xi,
+        tip_yi,
+        l_x,
+        l_y,
+        core,
+        CORE_ARROW_R,
+        CORE_ARROW_G,
+        CORE_ARROW_B,
+        CORE_ARROW_A,
+    );
+    stroke_thick_line(
+        pixels,
+        w,
+        h,
+        tip_xi,
+        tip_yi,
+        r_x,
+        r_y,
+        core,
+        CORE_ARROW_R,
+        CORE_ARROW_G,
+        CORE_ARROW_B,
+        CORE_ARROW_A,
+    );
+}
+
+/// 黒 + 白 + シアンの三重コントラスト（四隅ブラケットと中心十字）。
+fn draw_reticle(
     pixels: *mut u8,
     w: i32,
     h: i32,
@@ -600,31 +621,53 @@ fn draw_corner_brackets(
     cy: i32,
     size: i32,
     core: i32,
-    outline: i32,
 ) {
     let half = size / 2;
     let arm = size / 3;
-    let corners = [
-        (cx - half, cy - half, 1, 1),
-        (cx + half, cy - half, -1, 1),
-        (cx - half, cy + half, 1, -1),
-        (cx + half, cy + half, -1, -1),
+    let cross = size / 4;
+    let layers = [
+        (core + 4, BASE_R, BASE_G, BASE_B, 245u8),
+        (core + 2, WHITE_R, WHITE_G, WHITE_B, 255u8),
+        (core, CORE_ARROW_R, CORE_ARROW_G, CORE_ARROW_B, 255u8),
     ];
-    for (x, y, sx, sy) in corners {
+    for (th, r, g, b, a) in layers {
+        let corners = [
+            (cx - half, cy - half, 1, 1),
+            (cx + half, cy - half, -1, 1),
+            (cx - half, cy + half, 1, -1),
+            (cx + half, cy + half, -1, -1),
+        ];
+        for (x, y, sx, sy) in corners {
+            stroke_thick_line(pixels, w, h, x, y, x + sx * arm, y, th, r, g, b, a);
+            stroke_thick_line(pixels, w, h, x, y, x, y + sy * arm, th, r, g, b, a);
+        }
         stroke_thick_line(
-            pixels, w, h, x, y, x + sx * arm, y, core + outline, OUT_R, OUT_G, OUT_B, OUT_A,
+            pixels,
+            w,
+            h,
+            cx - cross,
+            cy,
+            cx + cross,
+            cy,
+            th,
+            r,
+            g,
+            b,
+            a,
         );
         stroke_thick_line(
-            pixels, w, h, x, y, x, y + sy * arm, core + outline, OUT_R, OUT_G, OUT_B, OUT_A,
-        );
-        stroke_thick_line(
-            pixels, w, h, x, y, x + sx * arm, y, core, CORE_R, CORE_G, CORE_B, CORE_A,
-        );
-        stroke_thick_line(
-            pixels, w, h, x, y, x, y + sy * arm, core, CORE_R, CORE_G, CORE_B, CORE_A,
+            pixels,
+            w,
+            h,
+            cx,
+            cy - cross,
+            cx,
+            cy + cross,
+            th,
+            r,
+            g,
+            b,
+            a,
         );
     }
 }
-
-#[allow(dead_code)]
-fn _rect_ty(_: RECT) {}

@@ -25,7 +25,8 @@ use photon_pointer_warp::domain::shake::ShakeDetector;
 use photon_pointer_warp::domain::tracking::{TrackingAction, TrackingController};
 use photon_pointer_warp::domain::trigger::{TriggerCoordinator, TriggerSource};
 use photon_pointer_warp::domain::wave::{
-    max_radius_to_monitor_edge, WaveController, WavePhaseKind, WaveSignal,
+    max_radius_to_farthest_corner, AimBounds, WaveController, WavePhaseKind, WaveSignal,
+    ASCEND_RADIUS_PADDING_PX,
 };
 use photon_pointer_warp::platform::calibrate_window::CALIBRATE_MUTEX_NAME;
 use photon_pointer_warp::platform::capture::{capture_thumbnails, ThumbnailLayer};
@@ -84,7 +85,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
     GetWindowLongPtrW, KillTimer, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
     RegisterWindowMessageW, SetCursorPos, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
-    ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWL_EXSTYLE, MSG, PM_REMOVE, SW_HIDE,
+    ShowCursor, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWL_EXSTYLE, MSG, PM_REMOVE,
+    SW_HIDE,
     WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_HOTKEY, WM_INPUT, WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_MBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCMBUTTONDBLCLK, WM_SETTINGCHANGE,
     WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
@@ -183,6 +185,8 @@ struct AppState {
     /// Converging 完了時に左クリック射撃するか（WARP なら false）。
     wave_finish_shoot: bool,
     wave_finish_target: Option<(i32, i32)>,
+    /// 波動オーバーレイ表示中に OS カーソルを隠しているか。
+    wave_cursor_hidden: bool,
     config_mtime: Option<SystemTime>,
     raw_motion_history: VecDeque<(i32, i32, u64)>,
     input_clock_ms: u64,
@@ -421,6 +425,7 @@ pub fn run(config: AppConfig) -> io::Result<()> {
                 _mouse_ll: mouse_ll,
                 wave_finish_shoot: false,
                 wave_finish_target: None,
+                wave_cursor_hidden: false,
                 config_mtime: config_file_mtime(),
                 raw_motion_history: VecDeque::new(),
                 input_clock_ms: 0,
@@ -558,6 +563,7 @@ unsafe extern "system" fn wnd_proc(
             if let Some(mut guard) = APP.get().and_then(|a| a.try_lock().ok()) {
                 unregister_esc_hotkey_state(&mut guard, hwnd);
                 let _ = guard.hud.dismiss();
+                set_wave_os_cursor_hidden(&mut guard, false);
                 let _ = unsafe { guard.wave_overlay.hide() };
                 guard.wave.reset();
                 clear_consume_flags();
@@ -999,6 +1005,7 @@ fn handle_tray_command_sync(hwnd: HWND, id: u32) {
                 if guard.detection_paused {
                     cancel_settling(&mut guard);
                     if guard.wave.is_active() {
+                        set_wave_os_cursor_hidden(&mut guard, false);
                         let _ = unsafe { guard.wave_overlay.hide() };
                         guard.wave.reset();
                         clear_consume_flags();
@@ -1208,9 +1215,7 @@ fn tick_wave_session() {
     let _ = present_wave_overlay(&mut guard);
 }
 
-fn wave_max_radius(state: &AppState) -> f32 {
-    let snap = state.wave.snapshot();
-    let (x, y) = (snap.origin_x, snap.origin_y);
+fn wave_monitor_bounds(state: &AppState, x: f32, y: f32) -> Option<AimBounds> {
     let mon = state
         .display
         .monitors
@@ -1222,31 +1227,59 @@ fn wave_max_radius(state: &AppState) -> f32 {
                 && y >= r.top as f32
                 && y < r.bottom as f32
         })
-        .or_else(|| state.display.monitors.first());
-    if let Some(mon) = mon {
-        max_radius_to_monitor_edge(
+        .or_else(|| state.display.monitors.first())?;
+    Some(AimBounds {
+        left: mon.rect.left as f32,
+        top: mon.rect.top as f32,
+        right: mon.rect.right as f32,
+        bottom: mon.rect.bottom as f32,
+    })
+}
+
+fn wave_max_radius(state: &AppState) -> f32 {
+    let snap = state.wave.snapshot();
+    let (x, y) = (snap.origin_x, snap.origin_y);
+    if let Some(b) = wave_monitor_bounds(state, x, y) {
+        max_radius_to_farthest_corner(
             x,
             y,
-            mon.rect.left as f32,
-            mon.rect.top as f32,
-            mon.rect.right as f32,
-            mon.rect.bottom as f32,
+            b.left,
+            b.top,
+            b.right,
+            b.bottom,
+            ASCEND_RADIUS_PADDING_PX,
         )
     } else {
         400.0
     }
 }
 
+fn set_wave_os_cursor_hidden(state: &mut AppState, hide: bool) {
+    if state.wave_cursor_hidden == hide {
+        return;
+    }
+    unsafe {
+        if hide {
+            while ShowCursor(false) >= 0 {}
+        } else {
+            while ShowCursor(true) < 0 {}
+        }
+    }
+    state.wave_cursor_hidden = hide;
+}
+
 fn handle_wave_signal(state: &mut AppState, signal: WaveSignal, now: Instant) {
     match signal {
         WaveSignal::None => {}
         WaveSignal::PassthroughDrag => {
+            set_wave_os_cursor_hidden(state, false);
             let _ = unsafe { state.wave_overlay.hide() };
             clear_consume_flags();
             inject_middle_down();
             eprintln!("[wave] arming → middle-drag passthrough");
         }
         WaveSignal::PassthroughClick => {
+            set_wave_os_cursor_hidden(state, false);
             let _ = unsafe { state.wave_overlay.hide() };
             clear_consume_flags();
             inject_middle_click();
@@ -1255,7 +1288,11 @@ fn handle_wave_signal(state: &mut AppState, signal: WaveSignal, now: Instant) {
         WaveSignal::StartExpanding => {
             state.coordinator.reset();
             let snap = state.wave.snapshot();
+            if let Some(bounds) = wave_monitor_bounds(state, snap.origin_x, snap.origin_y) {
+                state.wave.set_aim_bounds(bounds);
+            }
             let _ = unsafe { SetCursorPos(snap.origin_x as i32, snap.origin_y as i32) };
+            set_wave_os_cursor_hidden(state, true);
             eprintln!("[wave] expanding");
         }
         WaveSignal::Freeze => {
@@ -1263,6 +1300,7 @@ fn handle_wave_signal(state: &mut AppState, signal: WaveSignal, now: Instant) {
         }
         WaveSignal::AscendToMap => {
             let snap = state.wave.snapshot();
+            set_wave_os_cursor_hidden(state, false);
             let _ = unsafe { state.wave_overlay.hide() };
             clear_consume_flags();
             state.wave.reset();
@@ -1312,6 +1350,7 @@ fn handle_wave_signal(state: &mut AppState, signal: WaveSignal, now: Instant) {
         WaveSignal::Finished => {
             state.wave_finish_shoot = false;
             state.wave_finish_target = None;
+            set_wave_os_cursor_hidden(state, false);
             let _ = unsafe { state.wave_overlay.hide() };
             clear_consume_flags();
             eprintln!("[wave] finished");
