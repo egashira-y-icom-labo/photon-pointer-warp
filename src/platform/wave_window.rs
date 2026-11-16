@@ -6,10 +6,11 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use crate::domain::wave::{WavePhaseKind, WaveSnapshot};
 use crate::platform::layout::VirtualScreen;
 use windows::core::w;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC,
+    CreateCompatibleDC, CreateFontW, DeleteDC, DeleteObject, DrawTextW, GetDC, ReleaseDC,
+    SelectObject, SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DEFAULT_CHARSET,
+    DIB_RGB_COLORS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_TOP, FW_BOLD, HDC, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -202,7 +203,14 @@ impl WaveOverlay {
 
         match snap.phase {
             WavePhaseKind::ImpactFlash => self.draw_impact_flash(snap),
-            WavePhaseKind::Converging => self.draw_converging(snap),
+            WavePhaseKind::Converging => {
+                self.draw_converging(snap);
+                self.draw_telemetry(snap);
+            }
+            WavePhaseKind::Expanding | WavePhaseKind::Frozen => {
+                self.draw_wave_body(snap);
+                self.draw_telemetry(snap);
+            }
             _ => self.draw_wave_body(snap),
         }
 
@@ -386,48 +394,251 @@ impl WaveOverlay {
         );
     }
 
+    unsafe fn draw_telemetry(&mut self, snap: &WaveSnapshot) {
+        let label = match snap.phase {
+            WavePhaseKind::Expanding => "SCANNING...",
+            WavePhaseKind::Frozen => "TARGET LOCKED",
+            WavePhaseKind::Converging => "ENGAGING",
+            _ => return,
+        };
+        let (ax, ay) = if snap.direction_locked {
+            (snap.target_x, snap.target_y)
+        } else {
+            (snap.tip_x, snap.tip_y)
+        };
+        let dx = ax - snap.origin_x;
+        let dy = ay - snap.origin_y;
+        let rng = dx.hypot(dy);
+        let azm = dy.atan2(dx).to_degrees();
+        let lines = [
+            label.to_string(),
+            format!("RNG : {rng:06.1} PX"),
+            format!("AZM : {azm:+06.1} DEG"),
+        ];
+
+        let anchor_x = ax as i32 - self.vs.x;
+        let anchor_y = ay as i32 - self.vs.y;
+        let pad = self.sx(6.0);
+        let line_h = self.sx(14.0);
+        let plate_w = self.sx(148.0);
+        let plate_h = pad * 2 + line_h * 3;
+        let ox_off = self.sx(24.0);
+        let oy_off = -self.sx(18.0);
+        let mut left = anchor_x + ox_off;
+        let top = (anchor_y + oy_off).max(2);
+        if left + plate_w > self.vs.width - 4 {
+            left = anchor_x - ox_off - plate_w;
+        }
+        left = left.clamp(2, (self.vs.width - plate_w - 2).max(2));
+
+        // 半透明黒プレート
+        fill_rect_alpha(
+            self.pixels,
+            self.vs.width,
+            self.vs.height,
+            left,
+            top,
+            plate_w,
+            plate_h,
+            0,
+            0,
+            0,
+            170,
+        );
+        // シアン枠
+        stroke_rect_alpha(
+            self.pixels,
+            self.vs.width,
+            self.vs.height,
+            left,
+            top,
+            plate_w,
+            plate_h,
+            CORE_RING_R,
+            CORE_RING_G,
+            CORE_RING_B,
+            200,
+            1,
+        );
+
+        let font = CreateFontW(
+            -self.sx(13.0),
+            0,
+            0,
+            0,
+            FW_BOLD.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            0,
+            0,
+            0,
+            0,
+            w!("Consolas"),
+        );
+        let old_font = SelectObject(self.dib_dc, font);
+        SetBkMode(self.dib_dc, TRANSPARENT);
+        for (i, line) in lines.iter().enumerate() {
+            let mut rect = RECT {
+                left: left + pad,
+                top: top + pad + i as i32 * line_h,
+                right: left + plate_w - pad,
+                bottom: top + pad + (i as i32 + 1) * line_h,
+            };
+            let mut wide: Vec<u16> = line.encode_utf16().collect();
+            // 影
+            let mut shadow = RECT {
+                left: rect.left + 1,
+                top: rect.top + 1,
+                right: rect.right + 1,
+                bottom: rect.bottom + 1,
+            };
+            SetTextColor(self.dib_dc, COLORREF(0));
+            let _ = DrawTextW(
+                self.dib_dc,
+                &mut wide,
+                &mut shadow,
+                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            // 本体（1行目は白寄り、他はシアン）
+            let color = if i == 0 {
+                COLORREF((255u32) << 16 | (255u32) << 8 | 255)
+            } else {
+                COLORREF((CORE_ARROW_B as u32) << 16 | (CORE_ARROW_G as u32) << 8 | CORE_ARROW_R as u32)
+            };
+            SetTextColor(self.dib_dc, color);
+            let _ = DrawTextW(
+                self.dib_dc,
+                &mut wide,
+                &mut rect,
+                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX,
+            );
+        }
+        let _ = SelectObject(self.dib_dc, old_font);
+        let _ = DeleteObject(font);
+        repair_gdi_text_alpha(
+            self.pixels,
+            self.vs.width,
+            self.vs.height,
+            left,
+            top,
+            left + plate_w,
+            top + plate_h,
+        );
+    }
+
     unsafe fn draw_impact_flash(&mut self, snap: &WaveSnapshot) {
         let cx = snap.target_x as i32 - self.vs.x;
         let cy = snap.target_y as i32 - self.vs.y;
         let t = snap.progress.clamp(0.0, 1.0);
-        let a = ((1.0 - t) * 240.0) as u8;
-        let r1 = self.sx(12.0 + 32.0 * t);
-        let r2 = self.sx(22.0 + 48.0 * t);
-        stroke_ring(
+        let fade = 1.0 - t;
+        let a = ((fade * 240.0) as u8).max(20);
+
+        // 時間差で広がる 3 重衝撃波
+        let rings = [
+            (0.00_f32, 18.0_f32, 110.0_f32, 7.0_f32),
+            (0.12, 10.0, 78.0, 5.0),
+            (0.24, 4.0, 48.0, 3.5),
+        ];
+        for (delay, r0, r1, thick) in rings {
+            let local = ((t - delay) / (1.0 - delay).max(0.01)).clamp(0.0, 1.0);
+            if t < delay {
+                continue;
+            }
+            let radius = self.sx(r0 + (r1 - r0) * local);
+            let ra = ((1.0 - local) * fade * 230.0) as u8;
+            stroke_ring(
+                self.pixels,
+                self.vs.width,
+                self.vs.height,
+                cx,
+                cy,
+                radius,
+                self.sx(thick + 3.0),
+                BASE_R,
+                BASE_G,
+                BASE_B,
+                ra.max(30),
+            );
+            stroke_ring(
+                self.pixels,
+                self.vs.width,
+                self.vs.height,
+                cx,
+                cy,
+                radius,
+                self.sx(thick),
+                CORE_ARROW_R,
+                CORE_ARROW_G,
+                CORE_ARROW_B,
+                ra.max(40),
+            );
+        }
+
+        // 放射スパーク（10 本、決定論的）
+        draw_impact_sparks(
             self.pixels,
             self.vs.width,
             self.vs.height,
             cx,
             cy,
-            r2,
-            self.sx(6.0),
-            BASE_R,
-            BASE_G,
-            BASE_B,
-            a.max(50),
+            t,
+            fade,
+            self.dpi_scale,
         );
-        stroke_ring(
-            self.pixels,
-            self.vs.width,
-            self.vs.height,
-            cx,
-            cy,
-            r1,
-            self.sx(3.5),
-            CORE_ARROW_R,
-            CORE_ARROW_G,
-            CORE_ARROW_B,
-            a.max(70),
-        );
-        draw_reticle(
-            self.pixels,
-            self.vs.width,
-            self.vs.height,
-            cx,
-            cy,
-            self.sx(20.0),
-            self.sx(3.0),
-        );
+
+        // 射撃のみ：弾痕＋ガラスひび割れ
+        if snap.is_shoot {
+            draw_bullet_cracks(
+                self.pixels,
+                self.vs.width,
+                self.vs.height,
+                cx,
+                cy,
+                fade,
+                self.dpi_scale,
+            );
+            let hole_a = ((fade * 255.0) as u8).max(40);
+            fill_disk(
+                self.pixels,
+                self.vs.width,
+                self.vs.height,
+                cx,
+                cy,
+                self.sx(7.0),
+                40,
+                20,
+                10,
+                ((fade * 180.0) as u8).max(30),
+            );
+            fill_disk(
+                self.pixels,
+                self.vs.width,
+                self.vs.height,
+                cx,
+                cy,
+                self.sx(4.5),
+                BASE_R,
+                BASE_G,
+                BASE_B,
+                hole_a,
+            );
+        }
+
+        let ret_a_scale = fade;
+        if ret_a_scale > 0.08 {
+            draw_reticle(
+                self.pixels,
+                self.vs.width,
+                self.vs.height,
+                cx,
+                cy,
+                self.sx(20.0),
+                self.sx(3.0),
+            );
+            let _ = a;
+        }
     }
 
     pub unsafe fn hide(&mut self) -> io::Result<()> {
@@ -827,5 +1038,258 @@ fn draw_reticle(
             b,
             a,
         );
+    }
+}
+
+fn fill_rect_alpha(
+    pixels: *mut u8,
+    w: i32,
+    h: i32,
+    x: i32,
+    y: i32,
+    rw: i32,
+    rh: i32,
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+) {
+    for yy in y..(y + rh) {
+        for xx in x..(x + rw) {
+            unsafe { put_px(pixels, w, h, xx, yy, b, g, r, a) };
+        }
+    }
+}
+
+fn stroke_rect_alpha(
+    pixels: *mut u8,
+    w: i32,
+    h: i32,
+    x: i32,
+    y: i32,
+    rw: i32,
+    rh: i32,
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+    thickness: i32,
+) {
+    let t = thickness.max(1);
+    fill_rect_alpha(pixels, w, h, x, y, rw, t, r, g, b, a);
+    fill_rect_alpha(pixels, w, h, x, y + rh - t, rw, t, r, g, b, a);
+    fill_rect_alpha(pixels, w, h, x, y, t, rh, r, g, b, a);
+    fill_rect_alpha(pixels, w, h, x + rw - t, y, t, rh, r, g, b, a);
+}
+
+fn repair_gdi_text_alpha(pixels: *mut u8, width: i32, height: i32, left: i32, top: i32, right: i32, bottom: i32) {
+    if pixels.is_null() {
+        return;
+    }
+    let left = left.max(0);
+    let top = top.max(0);
+    let right = right.min(width);
+    let bottom = bottom.min(height);
+    const TEXT_A: u8 = 235;
+    for y in top..bottom {
+        for x in left..right {
+            let idx = ((y * width + x) * 4) as isize;
+            unsafe {
+                let p = pixels.offset(idx);
+                let b = *p;
+                let g = *p.offset(1);
+                let r = *p.offset(2);
+                let a = *p.offset(3);
+                if a == 0 && (b | g | r) != 0 {
+                    let aa = TEXT_A as u16;
+                    *p = ((b as u16 * aa) / 255) as u8;
+                    *p.offset(1) = ((g as u16 * aa) / 255) as u8;
+                    *p.offset(2) = ((r as u16 * aa) / 255) as u8;
+                    *p.offset(3) = TEXT_A;
+                }
+            }
+        }
+    }
+}
+
+fn hash2(x: i32, y: i32) -> u32 {
+    let mut n = (x as u32)
+        .wrapping_mul(374761393)
+        .wrapping_add((y as u32).wrapping_mul(668265263))
+        .wrapping_add(0x9e3779b9);
+    n = (n ^ (n >> 13)).wrapping_mul(1274126177);
+    n ^ (n >> 16)
+}
+
+fn next_u32(state: &mut u32) -> u32 {
+    *state = state
+        .wrapping_mul(1664525)
+        .wrapping_add(1013904223);
+    *state
+}
+
+fn next_f32(state: &mut u32) -> f32 {
+    (next_u32(state) >> 8) as f32 / (1u32 << 24) as f32
+}
+
+fn draw_impact_sparks(
+    pixels: *mut u8,
+    w: i32,
+    h: i32,
+    cx: i32,
+    cy: i32,
+    t: f32,
+    fade: f32,
+    dpi: f32,
+) {
+    let mut rng = hash2(cx, cy ^ 0x5A17);
+    let count = 10;
+    for i in 0..count {
+        let base_ang = (i as f32 / count as f32) * std::f32::consts::TAU
+            + next_f32(&mut rng) * 0.35;
+        let len0 = (28.0 + next_f32(&mut rng) * 42.0) * dpi;
+        let delay = next_f32(&mut rng) * 0.15;
+        let local = ((t - delay) / (1.0 - delay).max(0.01)).clamp(0.0, 1.0);
+        if t < delay {
+            continue;
+        }
+        // 減速: ease-out
+        let ease = 1.0 - (1.0 - local) * (1.0 - local);
+        let travel = len0 * ease;
+        let spark_len = (len0 * 0.35 * (1.0 - local * 0.7)).max(4.0 * dpi);
+        let ux = base_ang.cos();
+        let uy = base_ang.sin();
+        let x0 = cx as f32 + ux * (travel - spark_len).max(0.0);
+        let y0 = cy as f32 + uy * (travel - spark_len).max(0.0);
+        let x1 = cx as f32 + ux * travel;
+        let y1 = cy as f32 + uy * travel;
+        let a = ((1.0 - local) * fade * 255.0) as u8;
+        stroke_thick_line(
+            pixels,
+            w,
+            h,
+            x0.round() as i32,
+            y0.round() as i32,
+            x1.round() as i32,
+            y1.round() as i32,
+            (2.0 * dpi).round().max(1.0) as i32 + 2,
+            BASE_R,
+            BASE_G,
+            BASE_B,
+            a.max(20),
+        );
+        stroke_thick_line(
+            pixels,
+            w,
+            h,
+            x0.round() as i32,
+            y0.round() as i32,
+            x1.round() as i32,
+            y1.round() as i32,
+            (2.0 * dpi).round().max(1.0) as i32,
+            CORE_ARROW_R,
+            CORE_ARROW_G,
+            CORE_ARROW_B,
+            a.max(30),
+        );
+    }
+}
+
+fn draw_bullet_cracks(
+    pixels: *mut u8,
+    w: i32,
+    h: i32,
+    cx: i32,
+    cy: i32,
+    fade: f32,
+    dpi: f32,
+) {
+    let mut rng = hash2(cx.wrapping_mul(3), cy.wrapping_mul(7));
+    let rays = 8 + (next_u32(&mut rng) % 3) as i32; // 8..10
+    let a = ((fade * 230.0) as u8).max(25);
+    let mut ends: Vec<(i32, i32, f32)> = Vec::with_capacity(rays as usize);
+
+    for i in 0..rays {
+        let ang = (i as f32 / rays as f32) * std::f32::consts::TAU
+            + (next_f32(&mut rng) - 0.5) * 0.4;
+        let len = (30.0 + next_f32(&mut rng) * 55.0) * dpi;
+        let mut x = cx as f32;
+        let mut y = cy as f32;
+        let segs = 3 + (next_u32(&mut rng) % 3) as i32;
+        let mut prev_x = x;
+        let mut prev_y = y;
+        for s in 1..=segs {
+            let t = s as f32 / segs as f32;
+            let jag = (next_f32(&mut rng) - 0.5) * 10.0 * dpi;
+            let px = -ang.sin();
+            let py = ang.cos();
+            x = cx as f32 + ang.cos() * len * t + px * jag;
+            y = cy as f32 + ang.sin() * len * t + py * jag;
+            stroke_thick_line(
+                pixels,
+                w,
+                h,
+                prev_x.round() as i32,
+                prev_y.round() as i32,
+                x.round() as i32,
+                y.round() as i32,
+                (1.5 * dpi).round().max(1.0) as i32 + 1,
+                BASE_R,
+                BASE_G,
+                BASE_B,
+                a,
+            );
+            stroke_thick_line(
+                pixels,
+                w,
+                h,
+                prev_x.round() as i32,
+                prev_y.round() as i32,
+                x.round() as i32,
+                y.round() as i32,
+                (1.2 * dpi).round().max(1.0) as i32,
+                220,
+                245,
+                255,
+                a,
+            );
+            prev_x = x;
+            prev_y = y;
+        }
+        ends.push((x.round() as i32, y.round() as i32, len));
+    }
+
+    // 同心円状の短い亀裂（放射線を繋ぐ）
+    for ring in 0..3 {
+        let frac = 0.28 + ring as f32 * 0.22;
+        for i in 0..ends.len() {
+            let (x0, y0, len0) = ends[i];
+            let (x1, y1, len1) = ends[(i + 1) % ends.len()];
+            let r0 = len0 * frac;
+            let r1 = len1 * frac;
+            let a0 = ((y0 - cy) as f32).atan2((x0 - cx) as f32);
+            let a1 = ((y1 - cy) as f32).atan2((x1 - cx) as f32);
+            let sx0 = cx as f32 + a0.cos() * r0;
+            let sy0 = cy as f32 + a0.sin() * r0;
+            let sx1 = cx as f32 + a1.cos() * r1;
+            let sy1 = cy as f32 + a1.sin() * r1;
+            // 短い弧の代わりに隣接点を結ぶ
+            if next_f32(&mut rng) > 0.25 {
+                stroke_thick_line(
+                    pixels,
+                    w,
+                    h,
+                    sx0.round() as i32,
+                    sy0.round() as i32,
+                    sx1.round() as i32,
+                    sy1.round() as i32,
+                    (1.0 * dpi).round().max(1.0) as i32,
+                    200,
+                    235,
+                    245,
+                    ((a as f32) * 0.75) as u8,
+                );
+            }
+        }
     }
 }

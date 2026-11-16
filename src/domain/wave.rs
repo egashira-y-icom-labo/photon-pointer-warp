@@ -22,8 +22,8 @@ pub const RADIUS_GROWTH_PX_PER_MS: f32 = 0.55;
 pub const RADIUS_ADJUST_PX_PER_MS: f32 = 0.45;
 /// 収束アニメ時間。
 pub const CONVERGE_MS: f32 = 180.0;
-/// 着弾フラッシュ時間。
-pub const IMPACT_FLASH_MS: f32 = 130.0;
+/// 着弾フラッシュ時間（衝撃波・スパークを視認できる長さ）。
+pub const IMPACT_FLASH_MS: f32 = 380.0;
 /// マップ昇華時に対角距離へ足す余裕。
 pub const ASCEND_RADIUS_PADDING_PX: f32 = 40.0;
 
@@ -130,6 +130,8 @@ pub struct WaveSnapshot {
     pub selected_rank: usize,
     pub ranked_ids: Vec<u64>,
     pub progress: f32,
+    /// 左クリック射撃経路（ImpactFlash の弾痕演出用）。WARP は false。
+    pub is_shoot: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -355,6 +357,7 @@ impl WaveController {
                     selected_rank: selected,
                     ranked_ids: ranked,
                     progress,
+                    is_shoot: false,
                 }
             }
             Phase::Converging {
@@ -365,6 +368,7 @@ impl WaveController {
                 tip_y,
                 target_x,
                 target_y,
+                shoot,
                 progress,
                 ..
             } => {
@@ -389,11 +393,13 @@ impl WaveController {
                     selected_rank: 0,
                     ranked_ids: ranked,
                     progress: *progress,
+                    is_shoot: *shoot,
                 }
             }
             Phase::ImpactFlash {
                 x,
                 y,
+                shoot,
                 progress,
                 ..
             } => WaveSnapshot {
@@ -406,6 +412,7 @@ impl WaveController {
                 target_y: *y,
                 direction_locked: true,
                 progress: *progress,
+                is_shoot: *shoot,
                 ..empty_snap(ranked)
             },
         }
@@ -864,6 +871,7 @@ fn empty_snap(ranked: Vec<u64>) -> WaveSnapshot {
         selected_rank: 0,
         ranked_ids: ranked,
         progress: 0.0,
+        is_shoot: false,
     }
 }
 
@@ -1033,8 +1041,34 @@ mod tests {
         w.on_relative_move(40.0, 0.0, 140);
         w.on_middle_up(150);
         assert_eq!(w.on_middle_up(200), WaveSignal::ConvergeWarp);
+        assert!(!w.snapshot().is_shoot);
         assert_eq!(w.on_tick(300, 800.0), WaveSignal::Impact);
+        assert!(!w.snapshot().is_shoot);
         assert_eq!(w.on_tick(360, 800.0), WaveSignal::Finished);
+    }
+
+    #[test]
+    fn shoot_path_marks_is_shoot_on_impact() {
+        let mut w = WaveController::new(WaveConfig {
+            converge_ms: 80.0,
+            impact_flash_ms: 40.0,
+            ..WaveConfig::default()
+        });
+        w.set_aim_bounds(AimBounds {
+            left: 0.0,
+            top: 0.0,
+            right: 800.0,
+            bottom: 600.0,
+        });
+        w.on_middle_down(100.0, 100.0, 0);
+        w.on_tick(130, 800.0);
+        w.on_relative_move(40.0, 0.0, 140);
+        w.on_middle_up(150);
+        assert_eq!(w.on_left_click(200), WaveSignal::ConvergeShoot);
+        assert!(w.snapshot().is_shoot);
+        assert_eq!(w.on_tick(300, 800.0), WaveSignal::Impact);
+        assert!(w.snapshot().is_shoot);
+        assert_eq!(w.snapshot().phase, WavePhaseKind::ImpactFlash);
     }
 
     #[test]
